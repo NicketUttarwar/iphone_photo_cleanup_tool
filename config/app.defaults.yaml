@@ -1,0 +1,42 @@
+# Default application settings (checked in). Override with config/app.local.yaml (gitignored).
+
+server:
+  host: "127.0.0.1"
+  port: 8765
+
+paths:
+  # Relative to repository root (--repo-root); runtime creates these as needed.
+  data_dir: "data"
+  logs_dir: "data/logs"
+  thumbnail_cache_dir: "data/thumbnail_cache"
+  scan_artifacts_dir: "data/scans"
+  mount_point: "data/iphone_mount"
+
+deletes:
+  # Delete non-kept files in chunks to reduce FUSE pressure.
+  chunk_size: 40
+
+tools:
+  # null means resolve from PATH by basename only (no env-based app config).
+  ideviceinfo: null
+  idevice_id: null
+  ifuse: null
+
+ui:
+  open_browser: true
+  thumbnail_max_edge: 320
+  thumbnail_jpeg_quality: 72
+  thumbnail_cache_max_mb: 512
+  max_concurrent_thumbnails: 3
+  sse_poll_interval_ms: 800
+
+duplicates:
+  keep_mode: manual
+  auto_best:
+    face_eye: false
+    # Only the first N files in each group run the heavier face/eye path (when face_eye is true).
+    face_eye_max_images_per_group: 6
+  phash_threshold: 6
+
+logging:
+  level: "INFO"

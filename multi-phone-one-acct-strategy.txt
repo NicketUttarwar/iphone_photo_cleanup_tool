@@ -1,0 +1,14 @@
+
+
+
+
+How to set up simultaneous backup:
+On Phone A: Open Amazon Photos → Tap the Smile/Profile icon → Settings → Uploads → Turn on Auto-Save.  
+
+On Phone B: Do the exact same thing.
+
+Pro Tip: If you use the same account, you can use the Search bar to filter by "Device" (e.g., search "iPhone 15") to see which photos came from which phone, even if they are in the same feed.
+
+Since you're managing multiple devices, are you looking to keep the two photo libraries strictly separated, or is the goal to have one giant combined family archive?
+
+

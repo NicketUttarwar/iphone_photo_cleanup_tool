@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Host prerequisites — iPhone Photo Cleanup</title>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <header class="top">
+    <h1>Host prerequisites</h1>
+    <p class="sub">Install these on the Mac before relying on mount/scan/delete.</p>
+  </header>
+  <section class="panel">
+    <h2>Checklist</h2>
+    <ol>
+      <li><strong>macFUSE</strong> — required for FUSE filesystems on macOS (ifuse depends on it).</li>
+      <li><strong>libimobiledevice</strong> — provides <code>ideviceinfo</code> and <code>idevice_id</code> for USB trust and device metadata.</li>
+      <li><strong>ifuse</strong> — mounts the iPhone media tree into the path configured as <code>paths.mount_point</code> in YAML.</li>
+      <li><strong>usbmuxd</strong> — usually installed with libimobiledevice; must be running for USB.</li>
+    </ol>
+    <p class="hint">If binaries are missing, run <code>./scripts/run.sh</code> and read the stderr hints from <code>scripts/check_host_prerequisites.sh</code>, or see <code>docs/workflows/first-run-setup.md</code>.</p>
+    <p><a href="/">← Back to app</a></p>
+  </section>
+</body>
+</html>

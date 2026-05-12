@@ -1,0 +1,38 @@
+# Copy to config/app.local.yaml and adjust (see ReadMe.txt).
+
+server:
+  host: "127.0.0.1"
+  port: 8765
+
+paths:
+  data_dir: "data"
+  logs_dir: "data/logs"
+  thumbnail_cache_dir: "data/thumbnail_cache"
+  scan_artifacts_dir: "data/scans"
+  mount_point: "data/iphone_mount"
+
+deletes:
+  chunk_size: 40
+
+tools:
+  ideviceinfo: null
+  idevice_id: null
+  ifuse: null
+
+ui:
+  open_browser: true
+  thumbnail_max_edge: 400
+  thumbnail_jpeg_quality: 75
+  thumbnail_cache_max_mb: 1024
+  max_concurrent_thumbnails: 3
+  sse_poll_interval_ms: 800
+
+duplicates:
+  keep_mode: manual
+  auto_best:
+    face_eye: false
+    face_eye_max_images_per_group: 6
+  phash_threshold: 6
+
+logging:
+  level: "INFO"
