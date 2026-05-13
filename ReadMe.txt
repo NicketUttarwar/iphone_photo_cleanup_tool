@@ -17,11 +17,21 @@ CURRENT STATE OF THIS REPOSITORY (as of last update)
 
 RUN (LOCAL)
 -----------
-1. Install macFUSE, libimobiledevice, and ifuse on the Mac (see **docs/workflows/first-run-setup.md**).
+1. Install macFUSE, libimobiledevice, and ifuse on the Mac (see **docs/workflows/first-run-setup.md**). On **Apple Silicon**, macFUSE may require a **one-time Recovery-mode** kernel-extension enablement and a **reboot** — see **APPLE SILICON: KERNEL EXTENSIONS** below.
 2. (Optional) Copy **`config/app.example.yaml`** to **`config/app.local.yaml`** and edit bind port, paths, or tool paths.
 3. From the repository root run **`./scripts/run.sh`** (full options and copy-paste examples are under **SCRIPTS (`scripts/`)** below). The app does not use environment variables for configuration.
 4. A browser tab opens to **`http://127.0.0.1:<port>/`** by default (disable with **`--no-open-browser`** on **`run.sh`** or **`ui.open_browser: false`** in YAML).
 5. **Logs** — structured lines go to **`data/logs/app.log`** (or the directory set by **`paths.logs_dir`** in YAML).
+
+
+APPLE SILICON: KERNEL EXTENSIONS (macFUSE / FUSE)
+-------------------------------------------------
+**macFUSE** uses a **kernel extension** (kext). On **Mac with Apple silicon** (M1/M2/M3/M4 or later), Apple does **not** let you fully enable that from normal macOS alone the first time: you must boot into **macOS Recovery**, open **Utilities → Startup Security Utility**, select your startup volume, choose **Security Policy**, enable **Reduced Security**, check **Allow user management of kernel extensions from identified developers**, confirm, then **restart** from the Apple menu so the Mac boots back into regular macOS. After that reboot you may still need to approve the extension or app in **System Settings** per your installer’s prompts.
+
+Step-by-step guide (print or open on another device before entering Recovery):  
+https://www.sweetwater.com/sweetcare/articles/kernel-extensions-on-mac-with-apple-silicon
+
+**FYI for new machines or new macOS installs:** expect at least one **full reboot** after the Recovery change before FUSE/macFUSE-backed tools behave; if **`ifuse`** or mounting failed before you did this, finish Recovery + reboot + any System Settings approvals, then run **`./scripts/run.sh`** or **`scripts/check_host_prerequisites.sh`** again.
 
 
 SCRIPTS (`scripts/`)

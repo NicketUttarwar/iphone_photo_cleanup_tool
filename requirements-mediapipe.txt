@@ -1,3 +1,4 @@
 # Optional: install for face/eye assist in auto_best (heavier). Not required for core duplicate flow.
+# Also used for fuzzy roll scan: approximate "eye count" = 2 × MediaPipe face detections (lightweight keeper hint).
 # Install with: .venv/bin/pip install -r requirements-mediapipe.txt
 mediapipe>=0.10.14

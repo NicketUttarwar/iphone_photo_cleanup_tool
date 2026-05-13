@@ -60,6 +60,8 @@ def _shutdown(ctx: AppCtx) -> None:
     """
     try:
         ctx.state.scan_cancel_event.set()
+        with ctx.state.lock:
+            ctx.state.pending_rescan_kind = None
     except Exception:
         pass
 

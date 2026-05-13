@@ -10,12 +10,12 @@ import uuid
 from pathlib import Path
 from typing import Any, Literal, Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from iphone_cleanup import auto_best, delete as delmod, device_bridge, documents, mount, prefs, scan, thumbnails
+from iphone_cleanup import auto_best, delete as delmod, device_bridge, documents, group_keep_util, mount, prefs, scan, thumbnails
 from iphone_cleanup.app_context import AppCtx
 from iphone_cleanup.app_log import log_event
 from iphone_cleanup.state import Phase
@@ -46,7 +46,9 @@ class KeepModeBody(BaseModel):
 
 class SelectionBody(BaseModel):
     group_id: str
-    keep_path: str
+    keep_path: Optional[str] = None
+    keep_paths: Optional[list[str]] = None
+    toggle_path: Optional[str] = None
 
 
 class DeleteBody(BaseModel):
@@ -122,6 +124,10 @@ def api_mount(request: Request) -> dict[str, Any]:
     ctx.state.mount_path = mp.resolve()
     ctx.state.mount_udid = udid
     ctx.state.ifuse_proc = proc
+    ctx.state.scan_cancel_event.clear()
+    with ctx.state.lock:
+        ctx.state.scan_cancel_requested = False
+        ctx.state.pending_rescan_kind = None
     ctx.state.set_phase(Phase.mounted)
     ctx.state.last_error = ""
     _touch(ctx)
@@ -133,6 +139,10 @@ def api_mount(request: Request) -> dict[str, Any]:
 def api_unmount(request: Request) -> dict[str, Any]:
     ctx = _ctx(request)
     mp = ctx.settings.mount_point
+    # Let any in-flight duplicate scan exit quickly; avoids applying results after the volume is gone.
+    ctx.state.scan_cancel_event.set()
+    with ctx.state.lock:
+        ctx.state.pending_rescan_kind = None
     if mount.is_mountpoint(mp):
         ctx.state.set_phase(Phase.unmounting)
     ok, msg = mount.unmount_path(mp)
@@ -140,6 +150,9 @@ def api_unmount(request: Request) -> dict[str, Any]:
         ctx.state.mount_path = None
         ctx.state.mount_udid = None
         ctx.state.ifuse_proc = None
+        ctx.state.duplicate_groups = []
+        ctx.state.group_keep = {}
+        ctx.state.scan_artifact_path = None
         ctx.state.set_phase(Phase.idle)
         ctx.state.last_error = ""
         n_batches = documents.finalize_all_batches(ctx.settings.data_dir)
@@ -159,6 +172,86 @@ def api_unmount(request: Request) -> dict[str, Any]:
     return {"ok": ok, "message": msg}
 
 
+def _relpath_if_under(full_path: str, mount_root: Path) -> str | None:
+    try:
+        return str(Path(full_path).resolve().relative_to(mount_root.resolve()))
+    except ValueError:
+        return None
+
+
+def _duplicate_paths_to_delete(ctx: AppCtx) -> list[str]:
+    to_delete: list[str] = []
+    for g in ctx.state.duplicate_groups:
+        keep_set = group_keep_util.keep_paths_set(ctx, g)
+        for p in g.get("paths") or []:
+            if str(p) not in keep_set:
+                to_delete.append(str(p))
+    return to_delete
+
+
+def _scan_publish_stale(ctx: AppCtx, job_id: str, root: Path) -> bool:
+    """Return True if the scan job must not publish results (unmount, etc.)."""
+    try:
+        root_r = root.resolve()
+    except OSError:
+        root_r = root
+    with ctx.state.lock:
+        mp = ctx.state.mount_path
+        ph = ctx.state.phase
+    if ph != Phase.scanning:
+        ctx.state.finish_job(
+            job_id,
+            "Scan stopped — another action changed the session (for example unmount).",
+        )
+        _touch(ctx)
+        log_event("scan_publish_skipped", job_id=job_id, phase=ph.value)
+        return True
+    if mp is None:
+        ctx.state.finish_job(job_id, "Scan stopped — no volume mounted.")
+        ctx.state.set_phase(Phase.idle)
+        _touch(ctx)
+        log_event("scan_publish_skipped", job_id=job_id, reason="no_mount")
+        return True
+    try:
+        cur = Path(mp).resolve()
+    except OSError:
+        cur = None
+    if cur != root_r:
+        ctx.state.finish_job(job_id, "Scan stopped — mount path changed.")
+        ctx.state.set_phase(Phase.mounted)
+        _touch(ctx)
+        log_event("scan_publish_skipped", job_id=job_id, reason="mount_mismatch")
+        return True
+    return False
+
+
+def _maybe_start_pending_rescan(ctx: AppCtx) -> None:
+    """If the operator queued another scan while one was running, start it here (single worker chain)."""
+    with ctx.state.lock:
+        pending = ctx.state.pending_rescan_kind
+        ctx.state.pending_rescan_kind = None
+    if not pending:
+        return
+    root = ctx.state.mount_path
+    if pending not in ("exact", "fuzzy"):
+        log_event("scan_pending_dropped", reason="bad_kind", kind=pending)
+        return
+    if ctx.state.phase not in (Phase.mounted, Phase.reviewing):
+        log_event("scan_pending_dropped", reason="phase", phase=ctx.state.phase.value)
+        return
+    if not root or not root.is_dir():
+        log_event("scan_pending_dropped", reason="no_mount")
+        return
+    ctx.state.scan_cancel_event.clear()
+    with ctx.state.lock:
+        ctx.state.scan_cancel_requested = False
+    ctx.state.set_phase(Phase.scanning)
+    log_event("scan_start_chained", scan_kind=pending)
+    t = threading.Thread(target=_run_scan_thread, args=(ctx, pending), daemon=True)
+    t.start()
+    _touch(ctx)
+
+
 def _apply_auto_groups(ctx: AppCtx, *, force: bool = False) -> None:
     root = ctx.state.mount_path
     if not root:
@@ -168,99 +261,183 @@ def _apply_auto_groups(ctx: AppCtx, *, force: bool = False) -> None:
     )
     max_img = ctx.settings.duplicates_face_eye_max_images
     for g in ctx.state.duplicate_groups:
-        keep = auto_best.pick_recommended(
-            list(g.get("paths") or []),
-            face_eye=face,
-            face_eye_max_images=max_img,
-        )
-        if keep:
-            g["recommendedKeep"] = keep
-            ctx.state.group_keep[str(g["id"])] = keep
-    _touch(ctx)
-
-
-def _run_scan_thread(ctx: AppCtx) -> None:
-    job = ctx.state.start_job("scan", "Scanning library for duplicates…")
-    root = ctx.state.mount_path
-    if not root or not root.is_dir():
-        ctx.state.finish_job(job.job_id, "No mount path.")
-        ctx.state.set_phase(Phase.mounted)
-        _touch(ctx)
-        return
-    cancelled = False
-    groups: list[dict[str, Any]]
-
-    def prog(cur: int, total: int, msg: str) -> None:
-        ctx.state.update_job(job.job_id, f"{msg} ({cur}/{total})")
-
-    try:
-        groups = scan.scan_duplicates(
-            root,
-            ctx.settings.phash_threshold,
-            progress_callback=prog,
-            cancel_event=ctx.state.scan_cancel_event,
-        )
-    except scan.ScanCancelled as e:
-        groups = scan.finalize_duplicate_groups(e.partial_groups)
-        cancelled = True
-    except Exception as e:
-        ctx.state.last_error = str(e)
-        ctx.state.finish_job(job.job_id, str(e))
-        ctx.state.set_phase(Phase.mounted)
-        _touch(ctx)
-        log_event("scan_error", job_id=job.job_id, error=str(e))
-        return
-
-    ctx.state.duplicate_groups = groups
-    ctx.state.group_keep = {}
-    for g in groups:
+        paths = list(g.get("paths") or [])
+        if not paths:
+            continue
         gid = str(g["id"])
-        rk = str(g.get("recommendedKeep") or (g.get("paths") or [""])[0])
-        g["recommendedKeep"] = rk
-        ctx.state.group_keep[gid] = rk
-    if ctx.effective_keep_mode() == "auto_best":
-        _apply_auto_groups(ctx, force=False)
-    art = ctx.settings.scan_artifacts_dir / f"scan_{int(time.time())}_{uuid.uuid4().hex[:8]}.json"
-    scan.write_artifact(art, groups)
-    ctx.state.scan_artifact_path = art
-    if cancelled and len(groups) == 0:
-        ctx.state.set_phase(Phase.mounted)
-        ctx.state.finish_job(job.job_id, "Scan cancelled (no groups yet).")
-        log_event("scan_cancelled_empty", job_id=job.job_id)
-    else:
-        ctx.state.set_phase(Phase.reviewing)
-        if cancelled:
-            ctx.state.finish_job(job.job_id, f"Scan cancelled — {len(groups)} duplicate group(s) so far.")
-            log_event("scan_cancelled", job_id=job.job_id, groups=len(groups))
+        if str(g.get("scan_kind") or "exact") == "fuzzy":
+            kps = auto_best.pick_fuzzy_keepers_by_eye_count(paths)
         else:
-            ctx.state.finish_job(job.job_id, f"Found {len(groups)} duplicate groups.")
-            log_event("scan_done", job_id=job.job_id, groups=len(groups))
+            keep = auto_best.pick_recommended(
+                paths,
+                face_eye=face,
+                face_eye_max_images=max_img,
+            )
+            kps = [keep] if keep else [paths[0]]
+        g["recommendedKeeps"] = list(kps)
+        g["recommendedKeep"] = kps[0]
+        ctx.state.group_keep[gid] = list(kps)
     _touch(ctx)
+
+
+def _run_scan_thread(ctx: AppCtx, scan_kind: Literal["exact", "fuzzy"]) -> None:
+    job_label = (
+        "Fuzzy roll scan (similar adjacent shots)…"
+        if scan_kind == "fuzzy"
+        else "Scanning library for duplicates…"
+    )
+    job = ctx.state.start_job("scan", job_label)
+    try:
+        root = ctx.state.mount_path
+        if not root or not root.is_dir():
+            ctx.state.finish_job(job.job_id, "No mount path.")
+            ctx.state.set_phase(Phase.mounted)
+            _touch(ctx)
+            return
+        cancelled = False
+        groups: list[dict[str, Any]]
+
+        def prog(cur: int, total: int, msg: str) -> None:
+            ctx.state.update_job(job.job_id, f"{msg} ({cur}/{total})")
+
+        try:
+            if scan_kind == "fuzzy":
+                groups = scan.scan_fuzzy_roll_bursts(
+                    root,
+                    phash_max_dim=ctx.settings.fuzzy_phash_max_dim,
+                    max_adjacent_hamming=ctx.settings.fuzzy_phash_max_hamming,
+                    progress_callback=prog,
+                    cancel_event=ctx.state.scan_cancel_event,
+                )
+            else:
+                groups = scan.scan_duplicates(
+                    root,
+                    ctx.settings.phash_threshold,
+                    progress_callback=prog,
+                    cancel_event=ctx.state.scan_cancel_event,
+                )
+        except scan.ScanCancelled as e:
+            if scan_kind == "fuzzy":
+                groups = scan.finalize_groups(e.partial_groups, scan_kind="fuzzy")
+            else:
+                groups = scan.finalize_duplicate_groups(e.partial_groups)
+            cancelled = True
+        except Exception as e:
+            ctx.state.last_error = str(e)
+            ctx.state.finish_job(job.job_id, str(e))
+            ctx.state.set_phase(Phase.mounted)
+            _touch(ctx)
+            log_event("scan_error", job_id=job.job_id, error=str(e))
+            return
+
+        if _scan_publish_stale(ctx, job.job_id, root):
+            return
+
+        ctx.state.duplicate_groups = groups
+        ctx.state.group_keep = {}
+        for g in groups:
+            gid = str(g["id"])
+            paths = list(g.get("paths") or [])
+            if not paths:
+                continue
+            if scan_kind == "fuzzy":
+                kps = auto_best.pick_fuzzy_keepers_by_eye_count(paths)
+            else:
+                kps = [str(g.get("recommendedKeep") or paths[0])]
+            g["recommendedKeeps"] = list(kps)
+            g["recommendedKeep"] = kps[0]
+            ctx.state.group_keep[gid] = list(kps)
+        if ctx.effective_keep_mode() == "auto_best":
+            _apply_auto_groups(ctx, force=False)
+        art = ctx.settings.scan_artifacts_dir / f"scan_{int(time.time())}_{uuid.uuid4().hex[:8]}.json"
+        scan.write_artifact(art, groups)
+        ctx.state.scan_artifact_path = art
+        if cancelled and len(groups) == 0:
+            ctx.state.set_phase(Phase.mounted)
+            ctx.state.finish_job(job.job_id, "Scan cancelled (no groups yet).")
+            log_event("scan_cancelled_empty", job_id=job.job_id)
+        else:
+            ctx.state.set_phase(Phase.reviewing)
+            if cancelled:
+                ctx.state.finish_job(
+                    job.job_id,
+                    f"Scan cancelled — {len(groups)} group(s) so far.",
+                )
+                log_event("scan_cancelled", job_id=job.job_id, groups=len(groups))
+            else:
+                done_msg = (
+                    f"Found {len(groups)} fuzzy burst group(s)."
+                    if scan_kind == "fuzzy"
+                    else f"Found {len(groups)} duplicate groups."
+                )
+                ctx.state.finish_job(job.job_id, done_msg)
+                log_event("scan_done", job_id=job.job_id, groups=len(groups), scan_kind=scan_kind)
+        _touch(ctx)
+    finally:
+        with ctx.state.lock:
+            ctx.state.scan_cancel_requested = False
+        _maybe_start_pending_rescan(ctx)
 
 
 @router.post("/api/scan/start")
-def api_scan_start(request: Request) -> dict[str, Any]:
+def api_scan_start(
+    request: Request,
+    kind: Literal["exact", "fuzzy"] = Query(
+        "exact",
+        description='Use "exact" for byte-identical pHash dupes, "fuzzy" for similar consecutive shots in roll order.',
+    ),
+) -> dict[str, Any]:
     ctx = _ctx(request)
+    if ctx.state.phase == Phase.scanning:
+        with ctx.state.lock:
+            ctx.state.pending_rescan_kind = kind
+        ctx.state.scan_cancel_event.set()
+        with ctx.state.lock:
+            ctx.state.scan_cancel_requested = True
+        log_event("scan_start_replace", scan_kind=kind)
+        _touch(ctx)
+        return {
+            "ok": True,
+            "replacing": True,
+            "message": "Stopping the current scan and switching to this one.",
+            "scan_kind": kind,
+        }
     if ctx.state.phase not in (Phase.mounted, Phase.reviewing):
         raise HTTPException(400, "Mount the device before scanning.")
     ctx.state.scan_cancel_event.clear()
+    with ctx.state.lock:
+        ctx.state.scan_cancel_requested = False
+        ctx.state.pending_rescan_kind = None
     ctx.state.set_phase(Phase.scanning)
-    log_event("scan_start")
-    t = threading.Thread(target=_run_scan_thread, args=(ctx,), daemon=True)
+    log_event("scan_start", scan_kind=kind)
+    t = threading.Thread(target=_run_scan_thread, args=(ctx, kind), daemon=True)
     t.start()
     _touch(ctx)
-    return {"ok": True, "message": "Scan started in background."}
+    msg = (
+        "Fuzzy roll scan started — watch Background work."
+        if kind == "fuzzy"
+        else "Exact duplicate scan started — watch Background work."
+    )
+    return {"ok": True, "message": msg, "scan_kind": kind}
 
 
 @router.post("/api/scan/cancel")
 def api_scan_cancel(request: Request) -> dict[str, Any]:
     ctx = _ctx(request)
     if ctx.state.phase != Phase.scanning:
-        raise HTTPException(400, "No scan is running.")
+        log_event("scan_cancel_noop", phase=ctx.state.phase.value)
+        _touch(ctx)
+        return {"ok": True, "noop": True, "message": "No duplicate scan was running."}
     ctx.state.scan_cancel_event.set()
+    with ctx.state.lock:
+        ctx.state.scan_cancel_requested = True
+        ctx.state.pending_rescan_kind = None
     log_event("scan_cancel_requested")
     _touch(ctx)
-    return {"ok": True, "message": "Cancellation requested; wait for the scan job to wind down."}
+    return {
+        "ok": True,
+        "message": "Stop requested — the scan worker exits almost immediately between photos and filesystem steps.",
+    }
 
 
 @router.get("/api/scan/groups")
@@ -286,21 +463,96 @@ def api_keep_mode(body: KeepModeBody, request: Request) -> dict[str, Any]:
 def api_selection(body: SelectionBody, request: Request) -> dict[str, Any]:
     ctx = _ctx(request)
     gid = body.group_id
-    keep = body.keep_path
+    actions = sum(
+        1
+        for x in (body.toggle_path is not None, body.keep_paths is not None, body.keep_path is not None)
+        if x
+    )
+    if actions != 1:
+        raise HTTPException(400, "Provide exactly one of: keep_path, keep_paths, or toggle_path.")
     found = False
     for g in ctx.state.duplicate_groups:
         if str(g.get("id")) != gid:
             continue
-        paths = list(g.get("paths") or [])
-        if keep not in paths:
-            raise HTTPException(400, "keep_path must be one of the group paths.")
-        ctx.state.group_keep[gid] = keep
+        paths = [str(x) for x in g.get("paths") or []]
+        path_set = set(paths)
+        chosen: list[str]
+        if body.toggle_path is not None:
+            tp = str(body.toggle_path)
+            if tp not in path_set:
+                raise HTTPException(400, "toggle_path must be one of the group paths.")
+            cur = group_keep_util.keep_paths_set(ctx, g)
+            nxt = set(cur)
+            if tp in nxt:
+                if len(nxt) <= 1:
+                    raise HTTPException(400, "Keep at least one image in this group.")
+                nxt.remove(tp)
+            else:
+                nxt.add(tp)
+            chosen = [p for p in paths if p in nxt]
+        elif body.keep_paths is not None:
+            kset = {str(p) for p in body.keep_paths}
+            if not kset:
+                raise HTTPException(400, "keep_paths must be non-empty.")
+            if not kset <= path_set:
+                raise HTTPException(400, "keep_paths must all belong to this group.")
+            chosen = [p for p in paths if p in kset]
+        else:
+            k = str(body.keep_path)
+            if k not in path_set:
+                raise HTTPException(400, "keep_path must be one of the group paths.")
+            chosen = [k]
+        ctx.state.group_keep[gid] = chosen
+        g["recommendedKeep"] = chosen[0]
+        g["recommendedKeeps"] = list(chosen)
         found = True
         break
     if not found:
         raise HTTPException(404, "Unknown group.")
     _touch(ctx)
     return {"ok": True}
+
+
+@router.get("/api/delete/preview")
+def api_delete_preview(request: Request) -> dict[str, Any]:
+    ctx = _ctx(request)
+    root = ctx.state.mount_path
+    if not root or not root.is_dir():
+        raise HTTPException(400, "Mount the device first.")
+    mroot = root.resolve()
+    to_delete = _duplicate_paths_to_delete(ctx)
+    total_bytes = 0
+    for raw in to_delete:
+        try:
+            total_bytes += Path(raw).resolve().stat().st_size
+        except OSError:
+            continue
+    groups_with_deletions = 0
+    thumbnail_samples: list[dict[str, str]] = []
+    max_thumbs = 40
+    for g in ctx.state.duplicate_groups:
+        gid = str(g.get("id"))
+        keep_set = group_keep_util.keep_paths_set(ctx, g)
+        paths = [str(x) for x in g.get("paths") or []]
+        has_del = any(p not in keep_set for p in paths)
+        if has_del:
+            groups_with_deletions += 1
+        if len(thumbnail_samples) >= max_thumbs:
+            continue
+        for p in paths:
+            if p in keep_set:
+                continue
+            rel = _relpath_if_under(str(p), mroot)
+            if rel:
+                thumbnail_samples.append({"group_id": gid, "relpath": rel})
+            break
+    return {
+        "file_count": len(to_delete),
+        "total_bytes": total_bytes,
+        "duplicate_group_count": len(ctx.state.duplicate_groups),
+        "groups_with_deletions": groups_with_deletions,
+        "thumbnail_samples": thumbnail_samples,
+    }
 
 
 @router.post("/api/delete")
@@ -317,15 +569,7 @@ def api_delete(body: DeleteBody, request: Request) -> dict[str, Any]:
 
     def work() -> None:
         try:
-            to_delete: list[str] = []
-            for g in ctx.state.duplicate_groups:
-                gid = str(g.get("id"))
-                keep = ctx.state.group_keep.get(gid)
-                if not keep:
-                    keep = str(g.get("recommendedKeep") or "")
-                for p in g.get("paths") or []:
-                    if str(p) != str(keep):
-                        to_delete.append(str(p))
+            to_delete = _duplicate_paths_to_delete(ctx)
             extra = [p for p in body.paths if p not in to_delete]
             if extra:
                 ctx.state.update_job(job.job_id, "Extra paths ignored (not in duplicate-to-delete set).")
@@ -352,7 +596,7 @@ def api_delete(body: DeleteBody, request: Request) -> dict[str, Any]:
                 job.job_id,
                 f"Deleted {len(res['deleted'])} files; failed {len(res['failed'])}; skipped {len(res['skipped'])}.",
             )
-            ctx.state.set_phase(Phase.reviewing)
+            ctx.state.set_phase(Phase.reviewing if ctx.state.mount_path else Phase.idle)
             log_event(
                 "delete_done",
                 job_id=job.job_id,
@@ -363,7 +607,7 @@ def api_delete(body: DeleteBody, request: Request) -> dict[str, Any]:
         except Exception as e:
             ctx.state.last_error = str(e)
             ctx.state.finish_job(job.job_id, str(e))
-            ctx.state.set_phase(Phase.reviewing)
+            ctx.state.set_phase(Phase.reviewing if ctx.state.mount_path else Phase.idle)
             log_event("delete_error", job_id=job.job_id, error=str(e))
         _touch(ctx)
 
@@ -438,13 +682,94 @@ def api_documents_preview(
     root = ctx.state.mount_path
     if not root or not root.is_dir():
         raise HTTPException(400, "Mount the device first.")
+    mroot = root.resolve()
     paths = documents.iter_document_paths(
         root,
         scope,
         include_visual_fallback=include_visual_fallback,
     )
-    sample = [str(p) for p in paths[:30]]
-    return {"count": len(paths), "sample": sample, "scope": scope, "include_visual_fallback": include_visual_fallback}
+    total_bytes = 0
+    for p in paths:
+        try:
+            total_bytes += p.stat().st_size
+        except OSError:
+            continue
+    sample = [str(p) for p in paths[:12]]
+    thumb_cap = 24
+    thumbnail_sample_relpaths: list[str] = []
+    for p in paths:
+        if len(thumbnail_sample_relpaths) >= thumb_cap:
+            break
+        rel = _relpath_if_under(str(p.resolve()), mroot)
+        if rel:
+            thumbnail_sample_relpaths.append(rel)
+    return {
+        "count": len(paths),
+        "total_bytes": total_bytes,
+        "sample": sample,
+        "thumbnail_sample_relpaths": thumbnail_sample_relpaths,
+        "scope": scope,
+        "include_visual_fallback": include_visual_fallback,
+    }
+
+
+@router.get("/api/documents/finalize-preview")
+def api_documents_finalize_preview(
+    request: Request,
+    all_batches: bool = False,
+    batch_id: Optional[str] = None,
+) -> dict[str, Any]:
+    ctx = _ctx(request)
+    bid = batch_id.strip() if batch_id else None
+    if not all_batches and not bid:
+        return documents.finalize_preview_data(ctx.settings.data_dir, batch_id=None, all_batches=False)
+    out = documents.finalize_preview_data(
+        ctx.settings.data_dir,
+        batch_id=bid,
+        all_batches=all_batches,
+    )
+    return out
+
+
+@router.get("/api/documents/holding-thumbnail")
+def api_documents_holding_thumbnail(
+    request: Request,
+    batch_id: str,
+    stored: str,
+) -> Any:
+    ctx = _ctx(request)
+    if not batch_id or ".." in batch_id or "/" in batch_id or "\\" in batch_id:
+        raise HTTPException(400, "Invalid batch id.")
+    if not stored or ".." in stored or "/" in stored or "\\" in stored:
+        raise HTTPException(400, "Invalid stored name.")
+    qroot = documents.document_quarantine_root(ctx.settings.data_dir).resolve()
+    batch_dir = (qroot / batch_id).resolve()
+    try:
+        batch_dir.relative_to(qroot)
+    except ValueError:
+        raise HTTPException(400, "Invalid batch.")
+    if not batch_dir.is_dir():
+        raise HTTPException(404, "Batch not found.")
+    full = (batch_dir / Path(stored).name).resolve()
+    try:
+        full.relative_to(batch_dir)
+    except ValueError:
+        raise HTTPException(400, "Invalid path.")
+    if not full.is_file():
+        raise HTTPException(404, "Not found.")
+    ctx.thumb_semaphore.acquire()
+    try:
+        data = thumbnails.get_thumbnail_jpeg(
+            full,
+            batch_dir.resolve(),
+            ctx.settings.thumbnail_cache_dir,
+            ctx.settings.thumbnail_max_edge,
+            ctx.settings.thumbnail_jpeg_quality,
+            ctx.settings.thumbnail_cache_max_mb,
+        )
+    finally:
+        ctx.thumb_semaphore.release()
+    return Response(content=data, media_type="image/jpeg")
 
 
 @router.post("/api/documents/remove")

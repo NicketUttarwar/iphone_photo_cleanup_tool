@@ -41,6 +41,8 @@ def write_defaults_yaml(repo_root: Path) -> Path:
             "keep_mode": "manual",
             "auto_best": {"face_eye": False, "face_eye_max_images_per_group": 2},
             "phash_threshold": 6,
+            "fuzzy_phash_max_hamming": 12,
+            "fuzzy_phash_max_dim": 128,
         },
         "logging": {"level": "INFO"},
     }

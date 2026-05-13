@@ -54,11 +54,13 @@ class AppState:
     ifuse_proc: Any = None
     scan_artifact_path: Path | None = None
     duplicate_groups: list[dict[str, Any]] = field(default_factory=list)
-    group_keep: dict[str, str] = field(default_factory=dict)
+    group_keep: dict[str, list[str]] = field(default_factory=dict)
     jobs: dict[str, JobStatus] = field(default_factory=dict)
     event_seq: int = 0
     runtime_keep_mode: str | None = None
     scan_cancel_event: threading.Event = field(default_factory=threading.Event)
+    scan_cancel_requested: bool = False
+    pending_rescan_kind: str | None = None
     last_delete_ledger: dict[str, Any] | None = None
     document_last_ledger: dict[str, Any] | None = None
 
@@ -77,6 +79,7 @@ class AppState:
         with self.lock:
             return {
                 "phase": self.phase.value,
+                "scan_cancel_pending": self.scan_cancel_requested,
                 "last_error": self.last_error,
                 "device": self.device_info,
                 "mount_udid": self.mount_udid,

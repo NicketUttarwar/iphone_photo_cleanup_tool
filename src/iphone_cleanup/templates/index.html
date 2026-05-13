@@ -35,8 +35,8 @@
   <section class="panel panel-guide" aria-labelledby="guideHeading">
     <h2 id="guideHeading">Step-by-step session</h2>
     <p class="guide-intro">
-      Work from top to bottom. Each step unlocks the next. If something fails, read the <strong>Device</strong> line above and the yellow/red alert — then see
-      <a href="/prerequisites">host prerequisites</a> (libimobiledevice, macFUSE, ifuse).
+      Follow the highlighted step. If something fails, check <strong>Device</strong> above and the alert banner, then
+      <a href="/prerequisites">host prerequisites</a>.
     </p>
     <ol class="steps">
       <li class="step" data-guide-step="1">
@@ -73,42 +73,40 @@
         <div class="step-inner">
           <span class="step-badge" aria-hidden="true">3</span>
           <div class="step-content">
-            <h3 class="step-title">Find duplicate photos <span class="step-tag">optional</span></h3>
+            <h3 class="step-title">Find duplicate / similar photos <span class="step-tag">optional</span></h3>
             <p class="step-text">
-              Runs in the background. You can <strong>skip this step</strong> if you only want document-style cleanup (step 5). If a scan is already running, use Cancel.
+              <strong>Exact</strong> finds same-size near-identical files. <strong>Fuzzy roll</strong> groups visually similar shots that appear next to each other in capture-time order (same-subject bursts). Cancel stops quickly; you can run either scan after the other when idle.
             </p>
             <div class="btn-row">
-              <button type="button" id="btnScan" class="primary" disabled>Start duplicate scan</button>
+              <button type="button" id="btnScan" class="primary" disabled>Exact duplicate scan</button>
+              <button type="button" id="btnScanFuzzy" class="primary" disabled>Fuzzy roll scan</button>
               <button type="button" id="btnScanCancel" class="danger-outline" disabled>Cancel scan</button>
             </div>
+            <p id="scanRunHint" class="hint scan-hint muted" aria-live="polite"></p>
           </div>
         </div>
       </li>
       <li class="step" data-guide-step="4">
-        <div class="step-inner">
+        <div class="step-inner step-jump" data-jump-target="dupReview" tabindex="0" role="link" aria-label="Scroll to duplicate review">
           <span class="step-badge" aria-hidden="true">4</span>
           <div class="step-content">
             <h3 class="step-title">Review duplicates &amp; delete extras</h3>
             <p class="step-text">
-              After the scan finishes, pick one <strong>keeper</strong> image per group in the section below, then use <strong>Delete non-kept duplicates</strong> when you are sure.
+              Tap thumbnails in the panel to toggle <strong>keep</strong> (blue ring + checkmark). You can keep several files per group; if every file in a group is marked keep, nothing is deleted there. <strong>Fuzzy</strong> bursts default to keeping images with the most detected eyes when MediaPipe is installed (see optional requirements). Tap this card to scroll to the duplicate summary.
             </p>
-            <div class="btn-row">
-              <button type="button" id="btnJumpDup" class="ghost">Jump to duplicate review</button>
-            </div>
+            <div class="step-jump-hint" aria-hidden="true">Scroll to duplicate summary ↓</div>
           </div>
         </div>
       </li>
       <li class="step" data-guide-step="5">
-        <div class="step-inner">
+        <div class="step-inner step-jump" data-jump-target="docPanel" tabindex="0" role="link" aria-label="Scroll to document cleanup">
           <span class="step-badge" aria-hidden="true">5</span>
           <div class="step-content">
             <h3 class="step-title">Document-style photos <span class="step-tag">optional</span></h3>
             <p class="step-text">
-              Separate workflow for tagged receipts/scans. Preview first, then remove — copies go to a Mac holding folder so you can undo while still mounted.
+              Receipts / scans: copies go to this Mac first so you can undo until you unmount. Tap this card to scroll to the controls.
             </p>
-            <div class="btn-row">
-              <button type="button" id="btnJumpDoc" class="ghost">Jump to document cleanup</button>
-            </div>
+            <div class="step-jump-hint" aria-hidden="true">Scroll to document cleanup ↓</div>
           </div>
         </div>
       </li>
@@ -120,10 +118,12 @@
             <p class="step-text">
               <strong>Before unplugging USB:</strong> close any Finder windows showing the iPhone volume, then unmount here. That flushes the session and clears the document holding area.
             </p>
+            <p class="hint">
+              Unmount is always available while the phone is mounted — including during an exact or fuzzy scan (it signals cancel) or during a duplicate delete. When unmount succeeds, it clears the document holding folder on this Mac; only unmount when you are done with undo / finalize.
+            </p>
             <div class="btn-row">
               <button type="button" id="btnUnmount" class="danger-outline">Unmount (safe)</button>
             </div>
-            <p class="hint">After bulk deletes, iOS may show ghost thumbnails until the phone re-indexes — a restart often fixes this.</p>
           </div>
         </div>
       </li>
@@ -132,37 +132,60 @@
 
   <section class="panel" id="dupReview">
     <h2>Duplicate review</h2>
+    <p id="dupReviewTeaser" class="dup-teaser" aria-live="polite"></p>
     <div class="btn-row">
-      <label class="inline"><input type="radio" name="keepMode" value="manual" checked /> Manual pick</label>
-      <label class="inline"><input type="radio" name="keepMode" value="auto_best" /> Auto best</label>
-      <button type="button" id="btnApplyAuto">Apply auto pick (respects face/eye assist in config)</button>
+      <button type="button" id="btnDupReviewOpen" class="primary" disabled>Open duplicate review…</button>
     </div>
-    <p class="hint">
-      <strong>Auto best</strong> ranks by sharpness, resolution, file size, then EXIF/mtime time (newer wins ties).
-      Optional <strong>face/eye</strong> assist (see <code>duplicates.auto_best.face_eye</code> in YAML) is approximate and can mis-rank closed eyes or profile shots; install <code>requirements-mediapipe.txt</code> for that path.
-      Your keep mode choice is saved under <code>data/ui_state.json</code> (ignored by git) when you change it here.
-    </p>
-    <div id="groups" class="groups"></div>
-    <div class="btn-row">
-      <button type="button" id="btnDelete" class="danger">Delete non-kept duplicates…</button>
-    </div>
+    <p class="hint muted">Long duplicate lists open in a scrollable panel so steps 5–6 stay one short scroll away.</p>
   </section>
+
+  <dialog id="dlgDupReview" class="dup-review-dialog" aria-labelledby="dupPopoutHeading">
+    <div class="dup-review-dialog-inner">
+      <header class="dup-popout-toolbar">
+        <h3 id="dupPopoutHeading" class="dup-popout-title">Duplicate review</h3>
+        <button type="button" id="btnDupReviewClose" class="ghost small-btn" aria-label="Close duplicate review panel">Close</button>
+      </header>
+      <div class="btn-row keep-mode-row dup-popout-keep-row">
+        <span class="keep-mode-label">Keeper choice:</span>
+        <label class="inline"><input type="radio" name="keepMode" value="manual" checked /> Manual (tap a photo per group)</label>
+        <label class="inline"><input type="radio" name="keepMode" value="auto_best" /> Auto best</label>
+        <button type="button" id="btnSuggestKeepers" class="ghost small-btn hidden" title="Fill keepers using auto ranking while staying in Manual mode">
+          Suggest keepers
+        </button>
+      </div>
+      <p class="hint dup-popout-hint">
+        <strong>Manual:</strong> tap photos to toggle keep (multiple allowed). Use <strong>Keep all in group</strong> beside each heading to mark every file in that set at once, then tap any tile to remove keep from individual photos. <strong>Auto best</strong> re-ranks keepers (exact: sharpness/size/recency + optional face/eye; fuzzy: most approximate “eye” count via MediaPipe when available). Delete only removes files you did <em>not</em> mark keep. If every file in a group is kept, that group contributes nothing to delete.
+      </p>
+      <div id="groups" class="groups dup-popout-groups"></div>
+      <footer class="dup-popout-footer btn-row">
+        <button type="button" id="btnDupReviewCloseFooter" class="ghost">Close</button>
+        <button type="button" id="btnDelete" class="danger">Delete non-kept duplicates…</button>
+      </footer>
+    </div>
+  </dialog>
 
   <section class="panel" id="docPanel">
     <h2>Document-style photos</h2>
     <p class="hint">
-      Matches Apple <strong>user tags</strong> on the file (Finder-style tags containing “Document”), path or filename hints such as “receipt” or “scan”, and optionally a lightweight “white paper with dark ink” screen.
-      Files are copied to a <strong>Mac-only holding folder</strong> under your configured <code>data_dir</code>, then removed from the phone so you can <strong>undo</strong> while still mounted.
-      <strong>Unmount</strong> clears that holding folder and wipes the thumbnail cache so the session ends clean; treat that as making removals final.
+      Matches <strong>Document</strong> user tags, path/filename hints (e.g. receipt, scan), or an optional white-paper heuristic. Files are copied to this Mac, then removed from the phone — <strong>Undo</strong> works until you unmount (unmount clears the holding folder and ends the session).
     </p>
+    <fieldset class="doc-scope-fieldset" id="docScopeFieldset">
+      <legend class="fieldset-legend">What to include</legend>
+      <div class="btn-row" style="flex-direction:column;align-items:flex-start;margin:0">
+        <label class="inline"><input type="radio" name="docScope" value="older_than_90d" checked /> Older than ~3 months (file date)</label>
+        <label class="inline"><input type="radio" name="docScope" value="all" /> All matches</label>
+        <label class="inline"><input type="checkbox" id="docVisualFallback" /> Include white-paper look-alikes without a tag (less precise)</label>
+      </div>
+    </fieldset>
+    <p id="docLivePreviewLabel" class="live-preview-label muted">Matches for your choices (updates when you change options above)</p>
+    <div id="docPreviewSummary" class="preview-summary" aria-live="polite">Mount the phone to see matches.</div>
+    <div id="docPreviewStrip" class="preview-thumb-strip hidden" aria-hidden="true"></div>
     <div class="btn-row">
-      <button type="button" id="btnDocPreview">Preview matches</button>
-      <button type="button" id="btnDocRemove">Remove from phone (reversible)…</button>
+      <button type="button" id="btnDocRemove" class="primary">Remove from phone…</button>
       <button type="button" id="btnDocUndo">Undo latest batch</button>
-      <button type="button" id="btnDocFinalize" class="danger-outline">Drop holding copies…</button>
+      <button type="button" id="btnDocFinalize" class="danger-outline">Drop Mac holding copies…</button>
     </div>
     <p id="docBatchInfo" class="hint" aria-live="polite"></p>
-    <pre id="docPreview" class="mono hidden" style="margin:0.5rem 0 0;max-height:180px;overflow:auto"></pre>
   </section>
 
   <section id="docLedgerPanel" class="panel hidden">
@@ -177,7 +200,11 @@
 
   <dialog id="dlgDelete">
     <form method="dialog" id="formDelete">
-      <p>This deletes every duplicate file in each group <strong>except</strong> the one marked keep. Type the phrase exactly:</p>
+      <p>This deletes every duplicate file in each group <strong>except</strong> the one marked keep.</p>
+      <div id="deletePreviewSummary" class="preview-summary dlg-preview-text"></div>
+      <div id="deletePreviewStrip" class="preview-thumb-strip dlg-preview-strip" aria-label="Sample images to be removed"></div>
+      <p class="dlg-preview-hint muted">Sample: one non-keeper per group (capped) so the UI stays responsive.</p>
+      <p>Type the phrase exactly:</p>
       <p><code>DELETE_SELECTED_FILES</code></p>
       <input type="text" id="confirmInput" autocomplete="off" />
       <div class="dlg-actions">
@@ -189,12 +216,10 @@
 
   <dialog id="dlgDocuments">
     <div>
-      <p>Choose scope, then confirm. Removal copies each file to this Mac first, then deletes it from the mount.</p>
-      <div class="btn-row" style="flex-direction:column;align-items:flex-start">
-        <label class="inline"><input type="radio" name="docScope" value="older_than_90d" checked /> Older than ~3 months (mtime)</label>
-        <label class="inline"><input type="radio" name="docScope" value="all" /> All matches</label>
-        <label class="inline"><input type="checkbox" id="docVisualFallback" /> Include white-paper look-alikes without a tag (less precise)</label>
-      </div>
+      <p>Removal copies each file to this Mac first, then deletes it from the phone. Scope matches the options you set in <strong>Document-style photos</strong> above.</p>
+      <div id="docDlgPreviewSummary" class="preview-summary dlg-preview-text"></div>
+      <div id="docDlgPreviewStrip" class="preview-thumb-strip dlg-preview-strip" aria-label="Sample document images to remove"></div>
+      <p class="dlg-preview-hint">Count and size include every match; thumbnails are a capped sample.</p>
       <p class="hint" style="margin-top:0.75rem">Type exactly:</p>
       <p><code>REMOVE_TAGGED_DOCUMENTS</code></p>
       <input type="text" id="docConfirmInput" autocomplete="off" />
@@ -207,8 +232,14 @@
 
   <dialog id="dlgDocFinalize">
     <p>This deletes the Mac-side holding copies for the selected batch (or all batches). You cannot restore from holding after this. Files already put back on the phone with Undo are unaffected.</p>
-    <label class="inline"><input type="checkbox" id="docFinalizeAll" checked /> All batches</label>
-    <input type="text" id="docFinalizeBatchId" placeholder="Batch id (if not all)" style="width:100%;margin-top:0.5rem" />
+    <div id="finalizePreviewSummary" class="preview-summary dlg-preview-text"></div>
+    <div id="finalizePreviewStrip" class="preview-thumb-strip dlg-preview-strip" aria-label="Sample holding copies to drop"></div>
+    <p class="dlg-preview-hint">Thumbnails are read from the Mac holding folder (not the phone). Showing a sample keeps the UI light.</p>
+    <label class="inline"><input type="checkbox" id="docFinalizeAll" checked /> All holding batches</label>
+    <div id="finalizeBatchPickWrap" class="finalize-batch-wrap hidden">
+      <label for="docFinalizeBatchSelect" class="select-label">Which batch</label>
+      <select id="docFinalizeBatchSelect"></select>
+    </div>
     <div class="dlg-actions">
       <button type="button" id="btnDocFinalizeCancel">Cancel</button>
       <button type="button" id="btnDocFinalizeConfirm" class="danger-outline">Finalize</button>

@@ -79,3 +79,19 @@ def test_finalize_drops_quarantine(tmp_path: Path) -> None:
     assert res["batch_id"] == "b2"
     documents.finalize_batch("b2", data)
     assert not (documents.document_quarantine_root(data) / "b2").exists()
+
+
+def test_finalize_preview_data_counts_bytes(tmp_path: Path) -> None:
+    mount = tmp_path / "mount"
+    data = tmp_path / "data"
+    mount.mkdir()
+    p = mount / "receipt_prev.jpg"
+    Image.new("RGB", (30, 30), "magenta").save(p, "JPEG")
+    res = documents.quarantine_and_remove([p], mount, data, batch_id="bprev")
+    bid = str(res.get("batch_id") or "bprev")
+    prev = documents.finalize_preview_data(data, batch_id=bid, all_batches=False)
+    assert prev["file_count"] == 1
+    assert prev["total_bytes"] > 100
+    assert len(prev["samples"]) == 1
+    prev_all = documents.finalize_preview_data(data, batch_id=None, all_batches=True)
+    assert prev_all["file_count"] == 1

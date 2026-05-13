@@ -141,3 +141,44 @@ def pick_recommended(
         reverse=True,
     )
     return scored[0][6]
+
+
+def count_approx_visible_eyes(path: Path, *, max_edge: int = 256) -> int:
+    """Lightweight proxy: 2 × face count via MediaPipe FaceDetection when installed; else 0."""
+    try:
+        import mediapipe as mp  # type: ignore
+    except ImportError:
+        return 0
+    try:
+        with Image.open(path) as im:
+            im = im.convert("RGB")
+            im.thumbnail((max_edge, max_edge))
+            arr = np.asarray(im)
+    except Exception:
+        return 0
+    try:
+        with mp.solutions.face_detection.FaceDetection(
+            model_selection=1,
+            min_detection_confidence=0.5,
+        ) as fd:
+            res = fd.process(arr)
+        dets = res.detections or []
+        return 2 * len(dets)
+    except Exception:
+        return 0
+
+
+def pick_fuzzy_keepers_by_eye_count(paths: list[str], *, max_eye_checks: int = 24) -> list[str]:
+    """
+    Keep every image (among the first max_eye_checks) that ties for highest approximate eye count.
+    If MediaPipe is unavailable or all scores are 0, fall back to one pick_recommended choice.
+    """
+    if not paths:
+        return []
+    check = paths[: max(1, min(len(paths), max_eye_checks))]
+    scored = [(count_approx_visible_eyes(Path(p)), p) for p in check]
+    best = max((c for c, _ in scored), default=0)
+    if best <= 0:
+        one = pick_recommended(paths, face_eye=False, face_eye_max_images=len(paths))
+        return [one] if one else [paths[0]]
+    return [p for c, p in scored if c == best]

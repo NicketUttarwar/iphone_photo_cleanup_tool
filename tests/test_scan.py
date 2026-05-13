@@ -30,6 +30,8 @@ def test_finalize_duplicate_groups_sizes(tmp_path: Path):
     assert len(g["paths"]) == 2
     assert g["bytesSavedIfOneKept"] >= 0
     assert Path(g["recommendedKeep"]).name in ("a.bin", "b.bin")
+    assert g.get("scan_kind") == "exact"
+    assert isinstance(g.get("recommendedKeeps"), list)
 
 
 def test_scan_duplicates_finds_visual_dupes(tmp_path: Path):
@@ -38,6 +40,25 @@ def test_scan_duplicates_finds_visual_dupes(tmp_path: Path):
     groups = scan.scan_duplicates(d, phash_threshold=6)
     assert len(groups) == 1
     assert len(groups[0]["paths"]) == 2
+    assert groups[0].get("scan_kind") == "exact"
+
+
+def test_fuzzy_roll_groups_similar_adjacent(tmp_path: Path):
+    d = tmp_path / "roll"
+    d.mkdir()
+    img = Image.new("RGB", (48, 36), color=(90, 120, 200))
+    for name in ("a.jpg", "b.jpg", "c.jpg"):
+        img.save(d / name, "JPEG", quality=93)
+    groups = scan.scan_fuzzy_roll_bursts(
+        d,
+        phash_max_dim=96,
+        max_adjacent_hamming=14,
+        progress_callback=None,
+        cancel_event=None,
+    )
+    assert len(groups) >= 1
+    assert groups[0].get("scan_kind") == "fuzzy"
+    assert len(groups[0]["paths"]) >= 2
 
 
 def test_scan_cancelled_immediately(tmp_path: Path):
@@ -62,6 +83,17 @@ def test_load_artifact_empty_groups_key(tmp_path: Path):
     p = tmp_path / "x.json"
     p.write_text(json.dumps({}), encoding="utf-8")
     assert scan.load_artifact(p) == []
+
+
+def test_walk_cancel_during_rglob(tmp_path: Path):
+    root = tmp_path / "big"
+    root.mkdir()
+    for i in range(300):
+        (root / f"{i}.jpg").write_bytes(b"")
+    ev = threading.Event()
+    ev.set()
+    with pytest.raises(scan.ScanCancelled):
+        scan.scan_duplicates(root, phash_threshold=6, cancel_event=ev)
 
 
 def test_walk_images_filters_extensions(tmp_path: Path):

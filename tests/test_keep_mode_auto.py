@@ -25,8 +25,8 @@ def test_keep_mode_auto_best_updates_recommendations(test_client, app_ctx, setti
     gid = "g_auto"
     app_ctx.state.set_phase(Phase.reviewing)
     app_ctx.state.mount_path = mount_root.resolve()
-    app_ctx.state.duplicate_groups = [{"id": gid, "paths": [p1, p2], "recommendedKeep": p1}]
-    app_ctx.state.group_keep = {gid: p1}
+    app_ctx.state.duplicate_groups = [{"id": gid, "paths": [p1, p2], "recommendedKeep": p1, "recommendedKeeps": [p1]}]
+    app_ctx.state.group_keep = {gid: [p1]}
     r = test_client.post("/api/keep-mode", json={"mode": "auto_best"})
     assert r.status_code == 200
     assert app_ctx.effective_keep_mode() == "auto_best"

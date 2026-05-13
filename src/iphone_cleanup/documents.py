@@ -284,3 +284,80 @@ def list_batches(data_dir: Path) -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+def _quarantine_bytes_for_entries(batch_dir: Path, entries: list[dict[str, str]]) -> int:
+    total = 0
+    for ent in entries:
+        stored = ent.get("stored") or ""
+        if not stored or ".." in stored or "/" in stored or "\\" in stored:
+            continue
+        p = batch_dir / stored
+        if not p.is_file():
+            continue
+        try:
+            total += p.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def finalize_preview_data(
+    data_dir: Path,
+    *,
+    batch_id: str | None = None,
+    all_batches: bool = False,
+    max_samples: int = 24,
+) -> dict[str, Any]:
+    """Summarize Mac-side quarantine files that would be dropped by finalize (counts, bytes, thumbnail keys)."""
+
+    qroot = document_quarantine_root(data_dir)
+    if not qroot.is_dir():
+        return {
+            "file_count": 0,
+            "total_bytes": 0,
+            "batch_count": 0,
+            "samples": [],
+        }
+
+    dirs: list[Path] = []
+    if batch_id:
+        d = (qroot / batch_id).resolve()
+        try:
+            d.relative_to(qroot.resolve())
+        except ValueError:
+            return {"file_count": 0, "total_bytes": 0, "batch_count": 0, "samples": [], "error": "invalid_batch"}
+        if d.is_dir():
+            dirs = [d]
+    elif all_batches:
+        dirs = [p.resolve() for p in qroot.iterdir() if p.is_dir()]
+    else:
+        dirs = []
+
+    file_count = 0
+    total_bytes = 0
+    samples: list[dict[str, str]] = []
+    for batch_dir in dirs:
+        try:
+            batch_dir.relative_to(qroot.resolve())
+        except ValueError:
+            continue
+        ents = _read_manifest(batch_dir)
+        file_count += len(ents)
+        total_bytes += _quarantine_bytes_for_entries(batch_dir, ents)
+        bid = batch_dir.name
+        for ent in ents:
+            if len(samples) >= max_samples:
+                break
+            stored = ent.get("stored") or ""
+            if not stored or ".." in stored or "/" in stored or "\\" in stored:
+                continue
+            if (batch_dir / stored).is_file():
+                samples.append({"batch_id": bid, "stored": stored})
+
+    return {
+        "file_count": file_count,
+        "total_bytes": total_bytes,
+        "batch_count": len(dirs),
+        "samples": samples,
+    }

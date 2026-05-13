@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -48,10 +49,12 @@ def test_api_mount_success(mock_dev, mock_mount, test_client, app_ctx, tmp_path)
     mock_dev.return_value = {"trusted": True, "udid": "ud", "error": None}
     mock_mount.return_value = (True, "Mounted.", None)
     app_ctx.state.device_info = {"trusted": True, "udid": "ud"}
+    app_ctx.state.scan_cancel_event.set()
     r = test_client.post("/api/mount")
     assert r.status_code == 200
     assert app_ctx.state.phase == Phase.mounted
     assert app_ctx.state.mount_path is not None
+    assert not app_ctx.state.scan_cancel_event.is_set()
 
 
 @patch("iphone_cleanup.api.routes.mount.unmount_path")
@@ -59,6 +62,10 @@ def test_api_unmount(mock_um, test_client, app_ctx, settings):
     mock_um.return_value = (True, "ok")
     app_ctx.state.set_phase(Phase.mounted)
     app_ctx.state.mount_path = Path("/tmp/fake")
+    app_ctx.state.duplicate_groups = [
+        {"id": "gx", "paths": ["/x/a.jpg"], "recommendedKeep": "/x/a.jpg", "recommendedKeeps": ["/x/a.jpg"]}
+    ]
+    app_ctx.state.group_keep = {"gx": ["/x/a.jpg"]}
     q = documents.document_quarantine_root(settings.data_dir) / "abatch"
     q.mkdir(parents=True, exist_ok=True)
     (q / "manifest.json").write_text('{"entries": []}', encoding="utf-8")
@@ -68,6 +75,8 @@ def test_api_unmount(mock_um, test_client, app_ctx, settings):
     assert r.status_code == 200
     assert r.json()["ok"] is True
     assert app_ctx.state.phase == Phase.idle
+    assert app_ctx.state.duplicate_groups == []
+    assert app_ctx.state.group_keep == {}
     assert not q.exists()
     assert not (settings.thumbnail_cache_dir / "x.jpg").exists()
 
@@ -89,7 +98,46 @@ def test_api_scan_start_without_mount(test_client, app_ctx):
 def test_api_scan_cancel_not_running(test_client, app_ctx):
     app_ctx.state.set_phase(Phase.mounted)
     r = test_client.post("/api/scan/cancel")
-    assert r.status_code == 400
+    assert r.status_code == 200
+    body = r.json()
+    assert body.get("ok") is True
+    assert body.get("noop") is True
+
+
+@patch("iphone_cleanup.api.routes.scan.scan_fuzzy_roll_bursts")
+@patch("iphone_cleanup.api.routes.scan.scan_duplicates")
+def test_api_scan_start_replaces_while_scan_running(mock_dup, mock_fuzzy, test_client, app_ctx, settings):
+    calls = {"n": 0}
+
+    def slow_scan(*_a, cancel_event=None, **_k):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            return []
+        deadline = time.time() + 15.0
+        while time.time() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                return []
+            time.sleep(0.01)
+        return []
+
+    mock_dup.side_effect = slow_scan
+    mock_fuzzy.side_effect = slow_scan
+    mp = settings.mount_point
+    mp.mkdir(parents=True, exist_ok=True)
+    app_ctx.state.set_phase(Phase.mounted)
+    app_ctx.state.mount_path = mp.resolve()
+    r1 = test_client.post("/api/scan/start")
+    assert r1.status_code == 200
+    r2 = test_client.post("/api/scan/start?kind=fuzzy")
+    assert r2.status_code == 200
+    body = r2.json()
+    assert body.get("replacing") is True
+    assert body.get("scan_kind") == "fuzzy"
+    deadline = time.time() + 10.0
+    while time.time() < deadline and app_ctx.state.phase == Phase.scanning:
+        time.sleep(0.05)
+    assert app_ctx.state.phase != Phase.scanning
+    assert calls["n"] >= 2
 
 
 def _write_dup_mount(mount: Path) -> None:
@@ -137,13 +185,13 @@ def test_keep_mode_and_selection(test_client, app_ctx, settings):
     p1 = str((mount_root / "DCIM" / "a.jpg").resolve())
     p2 = str((mount_root / "DCIM" / "b.jpg").resolve())
     gid = "g_test_1"
-    app_ctx.state.duplicate_groups = [{"id": gid, "paths": [p1, p2], "recommendedKeep": p1}]
-    app_ctx.state.group_keep = {gid: p1}
+    app_ctx.state.duplicate_groups = [{"id": gid, "paths": [p1, p2], "recommendedKeep": p1, "recommendedKeeps": [p1]}]
+    app_ctx.state.group_keep = {gid: [p1]}
     r = test_client.post("/api/keep-mode", json={"mode": "manual"})
     assert r.status_code == 200
     sel = test_client.post("/api/selection", json={"group_id": gid, "keep_path": p2})
     assert sel.status_code == 200
-    assert app_ctx.state.group_keep[gid] == p2
+    assert app_ctx.state.group_keep[gid] == [p2]
 
 
 def test_selection_unknown_group(test_client, app_ctx):
@@ -159,7 +207,76 @@ def test_selection_bad_keep_path(test_client, app_ctx):
     assert r.status_code == 400
 
 
-def test_delete_wrong_confirm(test_client, app_ctx):
+def test_selection_toggle_and_keep_paths(test_client, app_ctx):
+    gid = "g1"
+    p1 = "/mnt/a.jpg"
+    p2 = "/mnt/b.jpg"
+    app_ctx.state.duplicate_groups = [
+        {"id": gid, "paths": [p1, p2], "recommendedKeep": p1, "recommendedKeeps": [p1]}
+    ]
+    app_ctx.state.group_keep = {gid: [p1]}
+    assert test_client.post("/api/selection", json={"group_id": gid, "toggle_path": p2}).status_code == 200
+    assert set(app_ctx.state.group_keep[gid]) == {p1, p2}
+    r = test_client.post("/api/selection", json={"group_id": gid, "keep_paths": [p2]})
+    assert r.status_code == 200
+    assert app_ctx.state.group_keep[gid] == [p2]
+
+
+def test_selection_two_actions_rejected(test_client, app_ctx):
+    gid = "g1"
+    app_ctx.state.duplicate_groups = [
+        {"id": gid, "paths": ["/a.jpg", "/b.jpg"], "recommendedKeep": "/a.jpg", "recommendedKeeps": ["/a.jpg"]}
+    ]
+    r = test_client.post(
+        "/api/selection",
+        json={"group_id": gid, "keep_path": "/a.jpg", "toggle_path": "/b.jpg"},
+    )
+    assert r.status_code == 400
+
+
+def test_delete_preview_all_kept_zero_files(test_client, app_ctx, settings):
+    mount_root = settings.mount_point
+    sub = mount_root / "d2"
+    _write_dup_mount_in(sub)
+    p1 = str((sub / "a.jpg").resolve())
+    p2 = str((sub / "b.jpg").resolve())
+    gid = "gallkeep"
+    app_ctx.state.set_phase(Phase.reviewing)
+    app_ctx.state.mount_path = mount_root.resolve()
+    app_ctx.state.duplicate_groups = [
+        {"id": gid, "paths": [p1, p2], "recommendedKeep": p1, "recommendedKeeps": [p1, p2]}
+    ]
+    app_ctx.state.group_keep = {gid: [p1, p2]}
+    r = test_client.get("/api/delete/preview")
+    assert r.status_code == 200
+    assert r.json()["file_count"] == 0
+    assert r.json()["groups_with_deletions"] == 0
+
+
+def test_api_scan_fuzzy_finishes(test_client, app_ctx, settings):
+    mount_root = settings.mount_point
+    burst = mount_root / "DCIM" / "burst"
+    burst.mkdir(parents=True)
+    img = Image.new("RGB", (40, 30), color=(200, 100, 50))
+    for n in ("img1.jpg", "img2.jpg"):
+        img.save(burst / n, "JPEG", quality=92)
+    app_ctx.state.set_phase(Phase.mounted)
+    app_ctx.state.mount_path = mount_root.resolve()
+    r = test_client.post("/api/scan/start?kind=fuzzy")
+    assert r.status_code == 200
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        app_ctx.state.lock.acquire()
+        try:
+            ph = app_ctx.state.phase
+            gc = len(app_ctx.state.duplicate_groups)
+        finally:
+            app_ctx.state.lock.release()
+        if ph == Phase.reviewing and gc >= 1:
+            break
+        time.sleep(0.05)
+    assert app_ctx.state.phase == Phase.reviewing
+    assert any(str(g.get("scan_kind")) == "fuzzy" for g in app_ctx.state.duplicate_groups)
     app_ctx.state.set_phase(Phase.reviewing)
     app_ctx.state.mount_path = Path("/tmp")
     r = test_client.post("/api/delete", json={"paths": [], "confirm": "no"})
@@ -175,8 +292,10 @@ def test_delete_happy_path(test_client, app_ctx, settings):
     gid = "gdel1"
     app_ctx.state.set_phase(Phase.reviewing)
     app_ctx.state.mount_path = mount_root.resolve()
-    app_ctx.state.duplicate_groups = [{"id": gid, "paths": [keep, dup], "recommendedKeep": keep}]
-    app_ctx.state.group_keep = {gid: keep}
+    app_ctx.state.duplicate_groups = [
+        {"id": gid, "paths": [keep, dup], "recommendedKeep": keep, "recommendedKeeps": [keep]}
+    ]
+    app_ctx.state.group_keep = {gid: [keep]}
     r = test_client.post("/api/delete", json={"paths": [], "confirm": "DELETE_SELECTED_FILES"})
     assert r.status_code == 200
     deadline = time.time() + 30
@@ -265,6 +384,76 @@ def test_api_events_route_registered(app_ctx):
     app = create_app(app_ctx)
     paths = {getattr(route, "path", None) for route in app.routes}
     assert "/api/events" in paths
+
+
+def test_delete_preview_counts_and_samples(test_client, app_ctx, settings):
+    mount_root = settings.mount_point
+    sub = mount_root / "d"
+    _write_dup_mount_in(sub)
+    keep = str((sub / "a.jpg").resolve())
+    dup = str((sub / "b.jpg").resolve())
+    gid = "gprev1"
+    app_ctx.state.set_phase(Phase.reviewing)
+    app_ctx.state.mount_path = mount_root.resolve()
+    app_ctx.state.duplicate_groups = [
+        {"id": gid, "paths": [keep, dup], "recommendedKeep": keep, "recommendedKeeps": [keep]}
+    ]
+    app_ctx.state.group_keep = {gid: [keep]}
+    r = test_client.get("/api/delete/preview")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["file_count"] == 1
+    assert body["total_bytes"] > 0
+    assert body["groups_with_deletions"] == 1
+    assert len(body["thumbnail_samples"]) == 1
+    assert "relpath" in body["thumbnail_samples"][0]
+
+
+def test_api_documents_preview_includes_bytes_and_thumbs(test_client, app_ctx, settings):
+    mount = settings.mount_point
+    mount.mkdir(parents=True, exist_ok=True)
+    p = mount / "receipt_api.jpg"
+    Image.new("RGB", (40, 40), "yellow").save(p, "JPEG")
+    app_ctx.state.mount_path = mount.resolve()
+    app_ctx.state.set_phase(Phase.mounted)
+    r = test_client.get("/api/documents/preview", params={"scope": "all"})
+    assert r.status_code == 200
+    j = r.json()
+    assert j["count"] >= 1
+    assert j["total_bytes"] > 0
+    assert isinstance(j.get("thumbnail_sample_relpaths"), list)
+
+
+def test_api_finalize_preview_and_holding_thumbnail(test_client, app_ctx, settings):
+    mount = settings.mount_point
+    mount.mkdir(parents=True, exist_ok=True)
+    p = mount / "receipt_fin.jpg"
+    Image.new("RGB", (40, 40), "orange").save(p, "JPEG")
+    app_ctx.state.mount_path = mount.resolve()
+    app_ctx.state.set_phase(Phase.mounted)
+    test_client.post(
+        "/api/documents/remove",
+        json={"scope": "all", "confirm": "REMOVE_TAGGED_DOCUMENTS", "include_visual_fallback": False},
+    )
+    for _ in range(80):
+        time.sleep(0.05)
+        st = test_client.get("/api/status").json()
+        doc_jobs = [j for j in st.get("jobs", []) if j.get("kind") == "document_remove"]
+        if doc_jobs and not doc_jobs[-1].get("running"):
+            break
+    pr = test_client.get("/api/documents/finalize-preview", params={"all_batches": True})
+    assert pr.status_code == 200
+    pj = pr.json()
+    assert pj["file_count"] >= 1
+    assert pj["total_bytes"] > 0
+    assert pj.get("samples")
+    s0 = pj["samples"][0]
+    th = test_client.get(
+        "/api/documents/holding-thumbnail",
+        params={"batch_id": s0["batch_id"], "stored": s0["stored"]},
+    )
+    assert th.status_code == 200
+    assert th.headers.get("content-type", "").startswith("image/")
 
 
 def test_openapi_documents_sse_events_route(app_ctx):

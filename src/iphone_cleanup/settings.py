@@ -60,6 +60,8 @@ class Settings:
     duplicates_auto_face_eye: bool
     duplicates_face_eye_max_images: int
     phash_threshold: int
+    fuzzy_phash_max_hamming: int
+    fuzzy_phash_max_dim: int
     log_level: str
 
     @staticmethod
@@ -99,5 +101,7 @@ class Settings:
             duplicates_auto_face_eye=bool(auto.get("face_eye", False)),
             duplicates_face_eye_max_images=int(auto.get("face_eye_max_images_per_group") or 6),
             phash_threshold=int(dup.get("phash_threshold") or 6),
+            fuzzy_phash_max_hamming=int(dup.get("fuzzy_phash_max_hamming") or 12),
+            fuzzy_phash_max_dim=int(dup.get("fuzzy_phash_max_dim") or 128),
             log_level=str(logging.get("level") or "INFO"),
         )

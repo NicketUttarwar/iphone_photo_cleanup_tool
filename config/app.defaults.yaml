@@ -37,6 +37,9 @@ duplicates:
     # Only the first N files in each group run the heavier face/eye path (when face_eye is true).
     face_eye_max_images_per_group: 6
   phash_threshold: 6
+  # Fuzzy (roll-order burst) scan: adjacent photos in capture-time order with pHash distance <= this are grouped.
+  fuzzy_phash_max_hamming: 12
+  fuzzy_phash_max_dim: 128
 
 logging:
   level: "INFO"
