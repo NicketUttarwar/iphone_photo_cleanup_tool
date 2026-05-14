@@ -13,7 +13,7 @@ import shutil
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from PIL import Image
 
@@ -172,6 +172,7 @@ def quarantine_and_remove(
     data_dir: Path,
     *,
     batch_id: str | None = None,
+    on_file: Callable[[int, int, str], None] | None = None,
 ) -> dict[str, Any]:
     """Copy each file into local quarantine, then unlink from mount. Returns manifest summary."""
     root = mount_root.resolve()
@@ -184,7 +185,10 @@ def quarantine_and_remove(
     removed: list[str] = []
     failed: list[dict[str, str]] = []
 
+    total_n = len(paths)
     for i, src in enumerate(paths):
+        if on_file:
+            on_file(i + 1, total_n, str(src))
         safe = delmod.resolve_under_mount(src, root)
         if safe is None:
             failed.append({"path": str(src), "error": "outside_mount_or_missing"})

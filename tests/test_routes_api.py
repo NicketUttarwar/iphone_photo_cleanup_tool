@@ -31,6 +31,17 @@ def test_api_status_includes_keep_mode(test_client, app_ctx):
     body = r.json()
     assert "phase" in body and body["keep_mode"] == app_ctx.effective_keep_mode()
     assert "document_batches" in body and isinstance(body["document_batches"], list)
+    assert "activity_log" in body and isinstance(body["activity_log"], list)
+
+
+def test_api_activity_log_clear(test_client, app_ctx):
+    app_ctx.state.append_activity("operator-visible test line")
+    assert len(app_ctx.state.activity_log) >= 1
+    r = test_client.post("/api/activity-log/clear")
+    assert r.status_code == 200
+    body = r.json()
+    assert body.get("ok") is True
+    assert len(app_ctx.state.activity_log) == 0
 
 
 @patch("iphone_cleanup.api.routes.device_bridge.detect_device")
@@ -49,12 +60,43 @@ def test_api_mount_success(mock_dev, mock_mount, test_client, app_ctx, tmp_path)
     mock_dev.return_value = {"trusted": True, "udid": "ud", "error": None}
     mock_mount.return_value = (True, "Mounted.", None)
     app_ctx.state.device_info = {"trusted": True, "udid": "ud"}
+    app_ctx.state.set_phase(Phase.device_detected)
     app_ctx.state.scan_cancel_event.set()
     r = test_client.post("/api/mount")
     assert r.status_code == 200
+    assert r.json().get("started") is True
+    deadline = time.time() + 5.0
+    while time.time() < deadline and app_ctx.state.phase != Phase.mounted:
+        time.sleep(0.02)
     assert app_ctx.state.phase == Phase.mounted
     assert app_ctx.state.mount_path is not None
     assert not app_ctx.state.scan_cancel_event.is_set()
+
+
+@patch("iphone_cleanup.api.routes.mount.mount_media")
+@patch("iphone_cleanup.api.routes.device_bridge.detect_device")
+def test_api_mount_409_while_mount_in_progress(mock_dev, mock_mount, test_client, app_ctx):
+    gate = threading.Event()
+
+    def blocked_mount(*_a, **_k):
+        if not gate.wait(timeout=5.0):
+            return (False, "timed out", None)
+        return (True, "Mounted.", None)
+
+    mock_dev.return_value = {"trusted": True, "udid": "ud", "error": None}
+    mock_mount.side_effect = blocked_mount
+    app_ctx.state.device_info = {"trusted": True, "udid": "ud"}
+    app_ctx.state.set_phase(Phase.device_detected)
+    r1 = test_client.post("/api/mount")
+    assert r1.status_code == 200
+    assert app_ctx.state.phase == Phase.mounting
+    r2 = test_client.post("/api/mount")
+    assert r2.status_code == 409
+    gate.set()
+    deadline = time.time() + 5.0
+    while time.time() < deadline and app_ctx.state.phase != Phase.mounted:
+        time.sleep(0.02)
+    assert app_ctx.state.phase == Phase.mounted
 
 
 @patch("iphone_cleanup.api.routes.mount.unmount_path")
@@ -104,12 +146,12 @@ def test_api_scan_cancel_not_running(test_client, app_ctx):
     assert body.get("noop") is True
 
 
-@patch("iphone_cleanup.api.routes.scan.scan_fuzzy_roll_bursts")
+@patch("iphone_cleanup.api.routes.scan.run_fuzzy_roll_scan_batch")
 @patch("iphone_cleanup.api.routes.scan.scan_duplicates")
-def test_api_scan_start_replaces_while_scan_running(mock_dup, mock_fuzzy, test_client, app_ctx, settings):
+def test_api_scan_start_replaces_while_scan_running(mock_dup, mock_batch, test_client, app_ctx, settings):
     calls = {"n": 0}
 
-    def slow_scan(*_a, cancel_event=None, **_k):
+    def slow_dup(*_a, cancel_event=None, **_k):
         calls["n"] += 1
         if calls["n"] >= 2:
             return []
@@ -120,12 +162,24 @@ def test_api_scan_start_replaces_while_scan_running(mock_dup, mock_fuzzy, test_c
             time.sleep(0.01)
         return []
 
-    mock_dup.side_effect = slow_scan
-    mock_fuzzy.side_effect = slow_scan
+    def slow_batch(*_a, cancel_event=None, **_k):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            return ([], 0, 0)
+        deadline = time.time() + 15.0
+        while time.time() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                return ([], 0, 0)
+            time.sleep(0.01)
+        return ([], 0, 0)
+
+    mock_dup.side_effect = slow_dup
+    mock_batch.side_effect = slow_batch
     mp = settings.mount_point
     mp.mkdir(parents=True, exist_ok=True)
     app_ctx.state.set_phase(Phase.mounted)
     app_ctx.state.mount_path = mp.resolve()
+    app_ctx.state.mount_udid = "pytest-udid"
     r1 = test_client.post("/api/scan/start")
     assert r1.status_code == 200
     r2 = test_client.post("/api/scan/start?kind=fuzzy")
@@ -262,6 +316,7 @@ def test_api_scan_fuzzy_finishes(test_client, app_ctx, settings):
         img.save(burst / n, "JPEG", quality=92)
     app_ctx.state.set_phase(Phase.mounted)
     app_ctx.state.mount_path = mount_root.resolve()
+    app_ctx.state.mount_udid = "pytest-udid"
     r = test_client.post("/api/scan/start?kind=fuzzy")
     assert r.status_code == 200
     deadline = time.time() + 60

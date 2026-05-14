@@ -5,8 +5,149 @@
 }
 body { margin: 0; line-height: 1.45; }
 .top { padding: 1rem 1.25rem; background: #0f172a; color: #f8fafc; }
-.top h1 { margin: 0 0 0.25rem; font-size: 1.25rem; }
+.brand {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.9rem;
+  max-width: 960px;
+}
+.brand-logo {
+  flex-shrink: 0;
+  width: 48px;
+  height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.65);
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  box-shadow: 0 0 0 1px rgba(148, 163, 184, 0.12);
+}
+.brand-logo svg { display: block; }
+.brand-logo-sm {
+  width: 44px;
+  height: 44px;
+  border-radius: 10px;
+}
+.brand-text { min-width: 0; }
+.top h1 { margin: 0 0 0.25rem; font-size: 1.35rem; font-weight: 700; letter-spacing: -0.02em; }
+.brand-product {
+  margin: 0 0 0.15rem;
+  font-size: 0.82rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #7dd3fc;
+  opacity: 0.95;
+}
 .sub { margin: 0; opacity: 0.85; font-size: 0.95rem; }
+.activity-hub {
+  margin: 0;
+  padding: 0.75rem 1.25rem 0.9rem;
+  background: #f1f5f9;
+  border-bottom: 1px solid #cbd5e1;
+}
+.activity-hub-hint {
+  margin: 0 0 0.6rem;
+  font-size: 0.88rem;
+  color: #334155;
+  max-width: 72ch;
+}
+.activity-jobs {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  margin-bottom: 0.55rem;
+}
+.activity-job {
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 0.5rem 0.65rem;
+}
+.activity-job-label {
+  font-weight: 600;
+  font-size: 0.88rem;
+  color: #0f172a;
+  margin-bottom: 0.35rem;
+}
+.activity-job-msg {
+  font-size: 0.82rem;
+  color: #475569;
+  word-break: break-word;
+  margin-top: 0.35rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+.progress-host {
+  height: 8px;
+  background: #e2e8f0;
+  border-radius: 999px;
+  overflow: hidden;
+}
+.progress-bar-inner {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #2563eb, #38bdf8);
+  transition: width 0.2s ease-out;
+}
+.progress-bar-inner.indeterminate {
+  width: 35% !important;
+  animation: indeterminate-slide 1.2s ease-in-out infinite;
+}
+@keyframes indeterminate-slide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(320%); }
+}
+.activity-log-wrap { margin-top: 0.35rem; }
+.activity-diagnostics {
+  font-size: 0.76rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  background: #1e293b;
+  color: #e2e8f0;
+  border: 1px solid #334155;
+  border-radius: 6px;
+  padding: 0.45rem 0.55rem;
+  margin-top: 0.35rem;
+  max-height: 10rem;
+  overflow: auto;
+  word-break: break-word;
+}
+.activity-log-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  margin-top: 0.4rem;
+  flex-wrap: wrap;
+}
+.activity-log-toolbar-hint { font-size: 0.8rem; max-width: 52ch; }
+.activity-job-details {
+  font-size: 0.72rem;
+  color: #64748b;
+  margin-top: 0.25rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  word-break: break-word;
+}
+.activity-log-caption {
+  font-size: 0.75rem;
+  color: #64748b;
+  margin-bottom: 0.25rem;
+}
+.activity-log {
+  margin: 0;
+  max-height: 18rem;
+  overflow-y: auto;
+  padding: 0.45rem 0.55rem;
+  font-size: 0.78rem;
+  line-height: 1.35;
+  background: #0f172a;
+  color: #e2e8f0;
+  border-radius: 6px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 .status-strip {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -169,27 +310,6 @@ button.ghost:hover {
   box-shadow: 0 8px 24px rgba(15, 23, 42, 0.25);
   font-size: 0.9rem;
 }
-.working {
-  margin: 0.75rem 1.25rem;
-  padding: 0.75rem 1rem;
-  border-radius: 8px;
-  border: 1px solid #94a3b8;
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  background: #fff;
-}
-.spinner {
-  width: 22px;
-  height: 22px;
-  border-radius: 999px;
-  border: 3px solid #cbd5e1;
-  border-top-color: #2563eb;
-  animation: spin 0.9s linear infinite;
-}
-@keyframes spin { to { transform: rotate(360deg); } }
-.working-title { font-weight: 600; }
-.working-text { font-size: 0.9rem; opacity: 0.85; }
 .panel { margin: 1rem 1.25rem 1.5rem; padding: 1rem; background: #fff; border: 1px solid #e2e8f0; border-radius: 10px; }
 .panel h2 { margin-top: 0; font-size: 1.05rem; }
 .btn-row { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin: 0.5rem 0; }

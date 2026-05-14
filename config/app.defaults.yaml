@@ -40,6 +40,8 @@ duplicates:
   # Fuzzy (roll-order burst) scan: adjacent photos in capture-time order with pHash distance <= this are grouped.
   fuzzy_phash_max_hamming: 12
   fuzzy_phash_max_dim: 128
+  # Fuzzy runs in roll-order slices of this many photos per click; pHashes are cached on disk between batches.
+  fuzzy_roll_batch_size: 1000
 
 logging:
   level: "INFO"

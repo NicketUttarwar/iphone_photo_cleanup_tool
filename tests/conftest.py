@@ -43,6 +43,7 @@ def write_defaults_yaml(repo_root: Path) -> Path:
             "phash_threshold": 6,
             "fuzzy_phash_max_hamming": 12,
             "fuzzy_phash_max_dim": 128,
+            "fuzzy_roll_batch_size": 1000,
         },
         "logging": {"level": "INFO"},
     }

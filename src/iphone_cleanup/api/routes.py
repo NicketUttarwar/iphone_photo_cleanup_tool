@@ -36,7 +36,71 @@ def _touch(ctx: AppCtx) -> None:
 def _enriched_snapshot(ctx: AppCtx) -> dict[str, Any]:
     snap = ctx.state.snapshot()
     snap["document_batches"] = documents.list_batches(ctx.settings.data_dir)
+    snap["fuzzy_roll_batch_size"] = ctx.settings.fuzzy_roll_batch_size
     return snap
+
+
+def _run_mount_thread(ctx: AppCtx, job_id: str, udid: str | None) -> None:
+    mp = ctx.settings.mount_point
+    try:
+
+        def on_status(msg: str) -> None:
+            ctx.state.update_job(job_id, msg, progress_current=None, progress_total=None)
+
+        ok, msg, proc = mount.mount_media(
+            ctx.settings.ifuse,
+            mp,
+            udid,
+            status_callback=on_status,
+        )
+        with ctx.state.lock:
+            phase_now = ctx.state.phase
+            existing_mount = ctx.state.mount_path
+        if phase_now != Phase.mounting:
+            if ok and proc is not None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            if ok and mount.is_mountpoint(mp) and existing_mount is None:
+                mount.unmount_path(mp)
+            ctx.state.finish_job(job_id, "Mount stopped because the session changed (for example unmount ran first).")
+            _touch(ctx)
+            log_event("mount_aborted_phase", job_id=job_id, phase=phase_now.value)
+            return
+        if not ok:
+            ctx.state.last_error = msg
+            ctx.state.finish_job(job_id, msg)
+            ctx.state.mount_path = None
+            ctx.state.mount_udid = None
+            ctx.state.ifuse_proc = None
+            ctx.state.set_phase(Phase.device_detected)
+            _touch(ctx)
+            log_event("mount_fail", detail=msg)
+            return
+        ctx.state.mount_path = mp.resolve()
+        ctx.state.mount_udid = udid
+        ctx.state.ifuse_proc = proc
+        ctx.state.scan_cancel_event.clear()
+        with ctx.state.lock:
+            ctx.state.scan_cancel_requested = False
+            ctx.state.pending_rescan_kind = None
+        ctx.state.set_phase(Phase.mounted)
+        ctx.state.last_error = ""
+        ctx.state.fuzzy_roll_next_start = 0
+        ctx.state.fuzzy_roll_total = None
+        ctx.state.finish_job(job_id, msg or "Mounted.")
+        _touch(ctx)
+        log_event("mount_ok", udid=str(udid), mount_path=str(ctx.state.mount_path))
+    except Exception as e:
+        ctx.state.last_error = str(e)
+        ctx.state.finish_job(job_id, str(e))
+        ctx.state.mount_path = None
+        ctx.state.mount_udid = None
+        ctx.state.ifuse_proc = None
+        ctx.state.set_phase(Phase.device_detected)
+        _touch(ctx)
+        log_event("mount_error", job_id=job_id, error=str(e))
 
 
 class KeepModeBody(BaseModel):
@@ -96,6 +160,15 @@ def api_status(request: Request) -> dict[str, Any]:
     return snap
 
 
+@router.post("/api/activity-log/clear")
+def api_activity_log_clear(request: Request) -> dict[str, Any]:
+    """Clear the rolling activity log in the UI (does not cancel jobs or change phase)."""
+    ctx = _ctx(request)
+    ctx.state.clear_activity_log()
+    _touch(ctx)
+    return {"ok": True, "message": "Activity log cleared."}
+
+
 @router.get("/api/device")
 def api_device(request: Request) -> dict[str, Any]:
     ctx = _ctx(request)
@@ -103,6 +176,12 @@ def api_device(request: Request) -> dict[str, Any]:
     ctx.state.device_info = dev
     if dev.get("trusted") and ctx.state.phase == Phase.idle:
         ctx.state.set_phase(Phase.device_detected)
+    ctx.state.append_activity(
+        "DEVICE CHECK | "
+        f"trusted={dev.get('trusted')} | name={dev.get('name')!r} | udid={dev.get('udid')!r} | "
+        f"ios_version={dev.get('ios_version')!r} | error={dev.get('error')!r} | "
+        f"session_phase={ctx.state.phase.value}"
+    )
     _touch(ctx)
     return dev
 
@@ -110,29 +189,44 @@ def api_device(request: Request) -> dict[str, Any]:
 @router.post("/api/mount")
 def api_mount(request: Request) -> dict[str, Any]:
     ctx = _ctx(request)
+    if ctx.state.phase == Phase.mounting:
+        raise HTTPException(409, "Mount already in progress — watch live progress at the top of the page.")
     dev = ctx.state.device_info or device_bridge.detect_device(ctx.settings.ideviceinfo, ctx.settings.idevice_id)
     if not dev.get("trusted"):
         raise HTTPException(400, dev.get("error") or "Device not ready for mount.")
     udid = dev.get("udid")
     mp = ctx.settings.mount_point
-    ok, msg, proc = mount.mount_media(ctx.settings.ifuse, mp, udid)
-    if not ok:
-        ctx.state.last_error = msg
+    if mount.is_mountpoint(mp):
+        ctx.state.mount_path = mp.resolve()
+        ctx.state.mount_udid = udid
+        ctx.state.ifuse_proc = None
+        ctx.state.scan_cancel_event.clear()
+        with ctx.state.lock:
+            ctx.state.scan_cancel_requested = False
+            ctx.state.pending_rescan_kind = None
+        ctx.state.set_phase(Phase.mounted)
+        ctx.state.last_error = ""
+        ctx.state.append_activity(
+            f"MOUNT SHORT-CIRCUIT | {mp.resolve()} was already mounted — session state refreshed | udid={udid!r}"
+        )
         _touch(ctx)
-        log_event("mount_fail", detail=msg)
-        raise HTTPException(500, msg)
-    ctx.state.mount_path = mp.resolve()
-    ctx.state.mount_udid = udid
-    ctx.state.ifuse_proc = proc
-    ctx.state.scan_cancel_event.clear()
-    with ctx.state.lock:
-        ctx.state.scan_cancel_requested = False
-        ctx.state.pending_rescan_kind = None
-    ctx.state.set_phase(Phase.mounted)
-    ctx.state.last_error = ""
+        log_event("mount_ok", udid=str(udid), mount_path=str(ctx.state.mount_path))
+        return {"ok": True, "message": "Already mounted at this path.", "mount_path": str(ctx.state.mount_path)}
+    ctx.state.append_activity(
+        f"MOUNT REQUEST | operator started mount | mount_point={mp.resolve()} | udid={udid!r} | "
+        f"entering_phase=mounting"
+    )
+    ctx.state.set_phase(Phase.mounting)
+    job = ctx.state.start_job("mount", "Mounting iPhone media…")
+    t = threading.Thread(target=_run_mount_thread, args=(ctx, job.job_id, udid), daemon=True)
+    t.start()
     _touch(ctx)
-    log_event("mount_ok", udid=str(udid), mount_path=str(ctx.state.mount_path))
-    return {"ok": True, "message": msg, "mount_path": str(ctx.state.mount_path)}
+    return {
+        "ok": True,
+        "started": True,
+        "message": "Mount started — watch live progress and the activity log at the top of the page.",
+        "job_id": job.job_id,
+    }
 
 
 @router.post("/api/unmount")
@@ -143,21 +237,43 @@ def api_unmount(request: Request) -> dict[str, Any]:
     ctx.state.scan_cancel_event.set()
     with ctx.state.lock:
         ctx.state.pending_rescan_kind = None
+    ctx.state.append_activity(
+        "UNMOUNT REQUEST | operator asked to unmount — signaling any in-flight scan to cancel; "
+        f"mount_point_config={mp.resolve()}"
+    )
     if mount.is_mountpoint(mp):
         ctx.state.set_phase(Phase.unmounting)
     ok, msg = mount.unmount_path(mp)
+    udid_for_cache = ctx.state.mount_udid
+    mp_for_cache = ctx.state.mount_path
     if ok:
+        if udid_for_cache and mp_for_cache:
+            try:
+                cache_p = scan.fuzzy_roll_cache_path(
+                    ctx.settings.scan_artifacts_dir,
+                    udid_for_cache,
+                    mp_for_cache,
+                )
+                cache_p.unlink(missing_ok=True)
+            except OSError:
+                pass
         ctx.state.mount_path = None
         ctx.state.mount_udid = None
         ctx.state.ifuse_proc = None
         ctx.state.duplicate_groups = []
         ctx.state.group_keep = {}
         ctx.state.scan_artifact_path = None
+        ctx.state.fuzzy_roll_next_start = 0
+        ctx.state.fuzzy_roll_total = None
         ctx.state.set_phase(Phase.idle)
         ctx.state.last_error = ""
         n_batches = documents.finalize_all_batches(ctx.settings.data_dir)
         cleared = thumbnails.clear_jpeg_cache(ctx.settings.thumbnail_cache_dir)
         log_event("unmount_finalize", quarantine_batches_dropped=n_batches, thumbnail_cache_files_cleared=cleared)
+        ctx.state.append_activity(
+            f"UNMOUNT OK | volume released | document_batches_dropped={n_batches} | "
+            f"thumbnail_cache_files_cleared={cleared} | session_reset_to_idle"
+        )
     else:
         ctx.state.last_error = msg
         if mount.is_mountpoint(mp):
@@ -167,6 +283,9 @@ def api_unmount(request: Request) -> dict[str, Any]:
             ctx.state.mount_udid = None
             ctx.state.ifuse_proc = None
             ctx.state.set_phase(Phase.idle)
+        ctx.state.append_activity(
+            f"UNMOUNT FAILED | still_mounted_at_config_path={mount.is_mountpoint(mp)} | detail={msg!r}"
+        )
     _touch(ctx)
     log_event("unmount", ok=ok, detail=msg)
     return {"ok": ok, "message": msg}
@@ -247,9 +366,20 @@ def _maybe_start_pending_rescan(ctx: AppCtx) -> None:
         ctx.state.scan_cancel_requested = False
     ctx.state.set_phase(Phase.scanning)
     log_event("scan_start_chained", scan_kind=pending)
-    t = threading.Thread(target=_run_scan_thread, args=(ctx, pending), daemon=True)
+    t = threading.Thread(target=_run_scan_thread, args=(ctx, pending, False), daemon=True)
     t.start()
     _touch(ctx)
+
+
+def _strip_fuzzy_groups(ctx: AppCtx) -> None:
+    """Remove fuzzy burst groups and their selection entries (used for fuzzy_restart)."""
+    with ctx.state.lock:
+        old_ids = {str(g["id"]) for g in ctx.state.duplicate_groups if str(g.get("scan_kind") or "exact") == "fuzzy"}
+        ctx.state.duplicate_groups = [
+            g for g in ctx.state.duplicate_groups if str(g.get("scan_kind") or "exact") != "fuzzy"
+        ]
+        for oid in old_ids:
+            ctx.state.group_keep.pop(oid, None)
 
 
 def _apply_auto_groups(ctx: AppCtx, *, force: bool = False) -> None:
@@ -280,9 +410,13 @@ def _apply_auto_groups(ctx: AppCtx, *, force: bool = False) -> None:
     _touch(ctx)
 
 
-def _run_scan_thread(ctx: AppCtx, scan_kind: Literal["exact", "fuzzy"]) -> None:
+def _run_scan_thread(
+    ctx: AppCtx,
+    scan_kind: Literal["exact", "fuzzy"],
+    fuzzy_restart: bool = False,
+) -> None:
     job_label = (
-        "Fuzzy roll scan (similar adjacent shots)…"
+        "Fuzzy roll batch (similar adjacent shots)…"
         if scan_kind == "fuzzy"
         else "Scanning library for duplicates…"
     )
@@ -295,15 +429,40 @@ def _run_scan_thread(ctx: AppCtx, scan_kind: Literal["exact", "fuzzy"]) -> None:
             _touch(ctx)
             return
         cancelled = False
-        groups: list[dict[str, Any]]
+        groups: list[dict[str, Any]] = []
+        fuzzy_next = 0
+        fuzzy_total = 0
+        batch_lo = 0
+        with ctx.state.lock:
+            fz_next_snap = ctx.state.fuzzy_roll_next_start
+        ctx.state.append_activity(
+            f"SCAN WORKER | job_id={job.job_id} | scan_kind={scan_kind} | fuzzy_restart={fuzzy_restart} | "
+            f"mount_root={root.resolve()} | fuzzy_roll_next_start={fz_next_snap} | "
+            f"fuzzy_roll_batch_size={ctx.settings.fuzzy_roll_batch_size} | mount_udid={ctx.state.mount_udid!r} | "
+            f"exact_phash_threshold={ctx.settings.phash_threshold} | fuzzy_adjacent_hamming_max="
+            f"{ctx.settings.fuzzy_phash_max_hamming} | fuzzy_phash_max_dim={ctx.settings.fuzzy_phash_max_dim}"
+        )
 
         def prog(cur: int, total: int, msg: str) -> None:
-            ctx.state.update_job(job.job_id, f"{msg} ({cur}/{total})")
+            if total > 0:
+                ctx.state.update_job(job.job_id, msg, progress_current=cur, progress_total=total)
+            else:
+                ctx.state.update_job(job.job_id, msg, progress_current=None, progress_total=None)
 
         try:
             if scan_kind == "fuzzy":
-                groups = scan.scan_fuzzy_roll_bursts(
+                if fuzzy_restart:
+                    _strip_fuzzy_groups(ctx)
+                    with ctx.state.lock:
+                        ctx.state.fuzzy_roll_next_start = 0
+                with ctx.state.lock:
+                    batch_lo = ctx.state.fuzzy_roll_next_start
+                groups, fuzzy_next, fuzzy_total = scan.run_fuzzy_roll_scan_batch(
                     root,
+                    scan_artifacts_dir=ctx.settings.scan_artifacts_dir,
+                    mount_udid=ctx.state.mount_udid,
+                    batch_start=batch_lo,
+                    batch_size=ctx.settings.fuzzy_roll_batch_size,
                     phash_max_dim=ctx.settings.fuzzy_phash_max_dim,
                     max_adjacent_hamming=ctx.settings.fuzzy_phash_max_hamming,
                     progress_callback=prog,
@@ -333,29 +492,53 @@ def _run_scan_thread(ctx: AppCtx, scan_kind: Literal["exact", "fuzzy"]) -> None:
         if _scan_publish_stale(ctx, job.job_id, root):
             return
 
-        ctx.state.duplicate_groups = groups
-        ctx.state.group_keep = {}
-        for g in groups:
-            gid = str(g["id"])
-            paths = list(g.get("paths") or [])
-            if not paths:
-                continue
-            if scan_kind == "fuzzy":
-                kps = auto_best.pick_fuzzy_keepers_by_eye_count(paths)
-            else:
+        had_any_groups_prior = bool(ctx.state.duplicate_groups)
+
+        if scan_kind == "fuzzy" and not cancelled:
+            with ctx.state.lock:
+                ctx.state.fuzzy_roll_next_start = fuzzy_next
+                ctx.state.fuzzy_roll_total = fuzzy_total
+
+        if scan_kind == "exact":
+            with ctx.state.lock:
+                ctx.state.fuzzy_roll_next_start = 0
+                ctx.state.fuzzy_roll_total = None
+            ctx.state.duplicate_groups = groups
+            ctx.state.group_keep = {}
+            for g in groups:
+                gid = str(g["id"])
+                paths = list(g.get("paths") or [])
+                if not paths:
+                    continue
                 kps = [str(g.get("recommendedKeep") or paths[0])]
-            g["recommendedKeeps"] = list(kps)
-            g["recommendedKeep"] = kps[0]
-            ctx.state.group_keep[gid] = list(kps)
+                g["recommendedKeeps"] = list(kps)
+                g["recommendedKeep"] = kps[0]
+                ctx.state.group_keep[gid] = list(kps)
+        else:
+            ctx.state.duplicate_groups = list(ctx.state.duplicate_groups) + groups
+            for g in groups:
+                gid = str(g["id"])
+                paths = list(g.get("paths") or [])
+                if not paths:
+                    continue
+                kps = auto_best.pick_fuzzy_keepers_by_eye_count(paths)
+                g["recommendedKeeps"] = list(kps)
+                g["recommendedKeep"] = kps[0]
+                ctx.state.group_keep[gid] = list(kps)
         if ctx.effective_keep_mode() == "auto_best":
             _apply_auto_groups(ctx, force=False)
         art = ctx.settings.scan_artifacts_dir / f"scan_{int(time.time())}_{uuid.uuid4().hex[:8]}.json"
-        scan.write_artifact(art, groups)
+        scan.write_artifact(art, groups, scan_kind="fuzzy" if scan_kind == "fuzzy" else None)
         ctx.state.scan_artifact_path = art
         if cancelled and len(groups) == 0:
-            ctx.state.set_phase(Phase.mounted)
-            ctx.state.finish_job(job.job_id, "Scan cancelled (no groups yet).")
-            log_event("scan_cancelled_empty", job_id=job.job_id)
+            if scan_kind == "fuzzy" and had_any_groups_prior:
+                ctx.state.set_phase(Phase.reviewing)
+                ctx.state.finish_job(job.job_id, "Fuzzy batch cancelled (no new groups this run).")
+                log_event("scan_cancelled", job_id=job.job_id, groups=0, scan_kind=scan_kind)
+            else:
+                ctx.state.set_phase(Phase.mounted)
+                ctx.state.finish_job(job.job_id, "Scan cancelled (no groups yet).")
+                log_event("scan_cancelled_empty", job_id=job.job_id)
         else:
             ctx.state.set_phase(Phase.reviewing)
             if cancelled:
@@ -363,13 +546,30 @@ def _run_scan_thread(ctx: AppCtx, scan_kind: Literal["exact", "fuzzy"]) -> None:
                     job.job_id,
                     f"Scan cancelled — {len(groups)} group(s) so far.",
                 )
-                log_event("scan_cancelled", job_id=job.job_id, groups=len(groups))
+                log_event("scan_cancelled", job_id=job.job_id, groups=len(groups), scan_kind=scan_kind)
             else:
-                done_msg = (
-                    f"Found {len(groups)} fuzzy burst group(s)."
-                    if scan_kind == "fuzzy"
-                    else f"Found {len(groups)} duplicate groups."
-                )
+                if scan_kind == "fuzzy":
+                    if fuzzy_total == 0:
+                        done_msg = "Fuzzy: no images found under the mount."
+                    elif not groups and fuzzy_next >= fuzzy_total:
+                        done_msg = (
+                            "Fuzzy: no burst groups in this slice; the roll is fully scanned for batches. "
+                            "POST /api/scan/start?kind=fuzzy&fuzzy_restart=true clears fuzzy groups and "
+                            "restarts from the top while reusing cached pHashes."
+                        )
+                    elif not groups:
+                        done_msg = (
+                            f"Fuzzy batch: no burst groups in photos {batch_lo}–{fuzzy_next} "
+                            f"of {fuzzy_total}. Run another batch when ready."
+                        )
+                    else:
+                        done_msg = (
+                            f"Found {len(groups)} fuzzy burst group(s) in this batch "
+                            f"(roll progress {fuzzy_next}/{fuzzy_total}). "
+                            "Review keep/delete, then click Fuzzy roll scan for the next chunk."
+                        )
+                else:
+                    done_msg = f"Found {len(groups)} duplicate groups."
                 ctx.state.finish_job(job.job_id, done_msg)
                 log_event("scan_done", job_id=job.job_id, groups=len(groups), scan_kind=scan_kind)
         _touch(ctx)
@@ -386,6 +586,10 @@ def api_scan_start(
         "exact",
         description='Use "exact" for byte-identical pHash dupes, "fuzzy" for similar consecutive shots in roll order.',
     ),
+    fuzzy_restart: bool = Query(
+        False,
+        description="Fuzzy only: clear fuzzy burst groups and re-run from roll index 0 (reuses cached pHashes).",
+    ),
 ) -> dict[str, Any]:
     ctx = _ctx(request)
     if ctx.state.phase == Phase.scanning:
@@ -395,6 +599,10 @@ def api_scan_start(
         with ctx.state.lock:
             ctx.state.scan_cancel_requested = True
         log_event("scan_start_replace", scan_kind=kind)
+        ctx.state.append_activity(
+            f"SCAN REPLACE | operator started a new {kind!r} scan while another was running — cancel signaled; "
+            f"pending_rescan_kind set to {kind!r}."
+        )
         _touch(ctx)
         return {
             "ok": True,
@@ -402,21 +610,28 @@ def api_scan_start(
             "message": "Stopping the current scan and switching to this one.",
             "scan_kind": kind,
         }
+    if ctx.state.phase == Phase.mounting:
+        raise HTTPException(400, "Wait for mounting to finish before scanning.")
     if ctx.state.phase not in (Phase.mounted, Phase.reviewing):
         raise HTTPException(400, "Mount the device before scanning.")
     ctx.state.scan_cancel_event.clear()
     with ctx.state.lock:
         ctx.state.scan_cancel_requested = False
         ctx.state.pending_rescan_kind = None
+    phase_before = ctx.state.phase.value
     ctx.state.set_phase(Phase.scanning)
     log_event("scan_start", scan_kind=kind)
-    t = threading.Thread(target=_run_scan_thread, args=(ctx, kind), daemon=True)
+    ctx.state.append_activity(
+        f"SCAN START | kind={kind!r} | fuzzy_restart={fuzzy_restart} | phase_before={phase_before} | phase_now=scanning | "
+        f"mount_path={ctx.state.mount_path!s} | duplicate_group_count={len(ctx.state.duplicate_groups)}"
+    )
+    t = threading.Thread(target=_run_scan_thread, args=(ctx, kind, fuzzy_restart), daemon=True)
     t.start()
     _touch(ctx)
     msg = (
-        "Fuzzy roll scan started — watch Background work."
+        "Fuzzy roll batch started — only the next slice of the library is hashed; progress is at the top."
         if kind == "fuzzy"
-        else "Exact duplicate scan started — watch Background work."
+        else "Exact duplicate scan started — watch live progress at the top of the page."
     )
     return {"ok": True, "message": msg, "scan_kind": kind}
 
@@ -432,6 +647,9 @@ def api_scan_cancel(request: Request) -> dict[str, Any]:
     with ctx.state.lock:
         ctx.state.scan_cancel_requested = True
         ctx.state.pending_rescan_kind = None
+    ctx.state.append_activity(
+        "SCAN CANCEL | operator requested stop — scan_cancel_event is set; in-flight scan exits between files/steps."
+    )
     log_event("scan_cancel_requested")
     _touch(ctx)
     return {
@@ -571,13 +789,27 @@ def api_delete(body: DeleteBody, request: Request) -> dict[str, Any]:
         try:
             to_delete = _duplicate_paths_to_delete(ctx)
             extra = [p for p in body.paths if p not in to_delete]
+            preview = to_delete[:8]
+            ctx.state.append_activity(
+                f"DELETE JOB | paths_to_delete={len(to_delete)} | chunk_size={ctx.settings.delete_chunk_size} | "
+                f"first_paths_preview={preview!r}"
+            )
             if extra:
                 ctx.state.update_job(job.job_id, "Extra paths ignored (not in duplicate-to-delete set).")
 
-            def prog(done: int, total: int, del_n: int, fail_n: int, skip_n: int) -> None:
+            def prog(done: int, total: int, del_n: int, fail_n: int, skip_n: int, last_path: str = "") -> None:
+                tail = Path(last_path).name if last_path else ""
+                msg = f"Deleting chunk progress {done}/{total} on phone volume"
+                if tail:
+                    msg += f" — last_file_name={tail}"
+                if last_path:
+                    msg += f" | last_full_path={last_path}"
+                msg += f" | running_totals deleted={del_n} failed={fail_n} skipped={skip_n}"
                 ctx.state.update_job(
                     job.job_id,
-                    f"Deleting {done}/{total} files… (deleted={del_n} failed={fail_n} skipped={skip_n})",
+                    msg,
+                    progress_current=done,
+                    progress_total=max(total, 1),
                 )
 
             res = delmod.delete_paths_chunked(
@@ -635,7 +867,16 @@ def _run_document_remove_thread(
             include_visual_fallback=include_visual_fallback,
         )
         total = len(paths)
-        ctx.state.update_job(job_id, f"Matched {total} image(s); copying to Mac holding area, then removing from device…")
+        ctx.state.append_activity(
+            f"DOCUMENT REMOVE | scope={scope!r} | include_visual_fallback={include_visual_fallback} | "
+            f"matched_paths={total} | quarantine_under_data_dir"
+        )
+        ctx.state.update_job(
+            job_id,
+            f"Matched {total} document image(s); each file is copied to this Mac, then removed from the phone.",
+            progress_current=0 if total else None,
+            progress_total=total if total else None,
+        )
         if total == 0:
             ctx.state.finish_job(job_id, "No matching document images for this scope.")
             ctx.state.document_last_ledger = {
@@ -645,7 +886,17 @@ def _run_document_remove_thread(
             }
             _touch(ctx)
             return
-        res = documents.quarantine_and_remove(paths, root, ctx.settings.data_dir, batch_id=None)
+        def on_file(cur: int, tot: int, fname: str) -> None:
+            ctx.state.update_job(
+                job_id,
+                f"Document copy+remove {cur}/{tot} | device_path={fname}",
+                progress_current=cur,
+                progress_total=tot,
+            )
+
+        res = documents.quarantine_and_remove(
+            paths, root, ctx.settings.data_dir, batch_id=None, on_file=on_file
+        )
         removed = int(res.get("copied_then_removed") or 0)
         failed = list(res.get("failed") or [])
         ctx.state.document_last_ledger = {
@@ -780,6 +1031,8 @@ def api_documents_remove(body: DocumentRemoveBody, request: Request) -> dict[str
     root = ctx.state.mount_path
     if not root or not root.is_dir():
         raise HTTPException(400, "Mount the device first.")
+    if ctx.state.phase == Phase.mounting:
+        raise HTTPException(400, "Wait for mounting to finish before document removal.")
     if ctx.state.phase == Phase.scanning:
         raise HTTPException(400, "Wait for the duplicate scan to finish.")
     if ctx.state.phase == Phase.deleting:

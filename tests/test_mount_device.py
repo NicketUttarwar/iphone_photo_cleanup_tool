@@ -35,14 +35,25 @@ def test_mount_media_already_mounted(_im, tmp_path: Path):
     assert ok and "Already" in msg and proc is None
 
 
-@patch("iphone_cleanup.mount.is_mountpoint", side_effect=[False, False])
+@patch("iphone_cleanup.mount.is_mountpoint", side_effect=[False, True])
+@patch("iphone_cleanup.mount.subprocess.Popen")
+def test_mount_media_success_after_poll(popen, _im, tmp_path: Path):
+    proc = MagicMock()
+    popen.return_value = proc
+    ok, msg, p = mount.mount_media(None, tmp_path, None, wait_seconds=5.0, poll_interval=0.01)
+    assert ok is True
+    assert p is proc
+    assert "Mounted" in msg
+
+
+@patch("iphone_cleanup.mount.is_mountpoint", return_value=False)
 @patch("iphone_cleanup.mount.subprocess.Popen")
 def test_mount_media_failure_reads_stderr(popen, _im, tmp_path: Path):
     proc = MagicMock()
     proc.stderr.read.return_value = "fuse failed"
     proc.stdout.read.return_value = ""
     popen.return_value = proc
-    ok, msg, p = mount.mount_media(None, tmp_path, None)
+    ok, msg, p = mount.mount_media(None, tmp_path, None, wait_seconds=0.35, poll_interval=0.05)
     assert ok is False
     assert "fuse failed" in msg
     proc.terminate.assert_called_once()

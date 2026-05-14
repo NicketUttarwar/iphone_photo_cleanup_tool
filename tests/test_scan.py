@@ -85,6 +85,53 @@ def test_load_artifact_empty_groups_key(tmp_path: Path):
     assert scan.load_artifact(p) == []
 
 
+def test_write_artifact_empty_with_scan_kind(tmp_path: Path):
+    p = tmp_path / "empty_fuzzy.json"
+    scan.write_artifact(p, [], scan_kind="fuzzy")
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert data["scan_kind"] == "fuzzy"
+    assert data["groups"] == []
+
+
+def test_fuzzy_roll_batch_advances_and_caches(tmp_path: Path):
+    d = tmp_path / "roll"
+    d.mkdir()
+    img = Image.new("RGB", (48, 36), color=(90, 120, 200))
+    for name in ("a.jpg", "b.jpg", "c.jpg"):
+        img.save(d / name, "JPEG", quality=93)
+    scan_root = tmp_path / "scans"
+    udid = "batchtest"
+    g1, next1, total = scan.run_fuzzy_roll_scan_batch(
+        d,
+        scan_artifacts_dir=scan_root,
+        mount_udid=udid,
+        batch_start=0,
+        batch_size=2,
+        phash_max_dim=96,
+        max_adjacent_hamming=14,
+        progress_callback=None,
+        cancel_event=None,
+    )
+    assert total == 3
+    assert next1 == 2
+    g2, next2, total2 = scan.run_fuzzy_roll_scan_batch(
+        d,
+        scan_artifacts_dir=scan_root,
+        mount_udid=udid,
+        batch_start=next1,
+        batch_size=2,
+        phash_max_dim=96,
+        max_adjacent_hamming=14,
+        progress_callback=None,
+        cancel_event=None,
+    )
+    assert total2 == 3
+    assert next2 == 3
+    assert isinstance(g1, list) and isinstance(g2, list)
+    cache_files = list((scan_root / "fuzzy_roll").glob("*.json"))
+    assert len(cache_files) == 1
+
+
 def test_walk_cancel_during_rglob(tmp_path: Path):
     root = tmp_path / "big"
     root.mkdir()

@@ -72,7 +72,7 @@ def test_delete_paths_chunked_progress(tmp_path: Path):
         paths.append(str(p))
     calls: list[tuple[int, int, int, int, int]] = []
 
-    def on_progress(done: int, total: int, dn: int, fn: int, sn: int) -> None:
+    def on_progress(done: int, total: int, dn: int, fn: int, sn: int, _last: str = "") -> None:
         calls.append((done, total, dn, fn, sn))
 
     res = delmod.delete_paths_chunked(paths, root, chunk_size=3, on_progress=on_progress)

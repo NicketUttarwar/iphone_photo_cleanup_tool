@@ -47,7 +47,7 @@ def delete_paths_chunked(
     chunk_size: int,
     on_progress: Any | None = None,
 ) -> dict[str, Any]:
-    """Delete in chunks; optional callback(done, total, deleted_n, failed_n, skipped_n)."""
+    """Delete in chunks; optional callback(done, total, deleted_n, failed_n, skipped_n, last_path)."""
 
     deleted: list[str] = []
     failed: list[dict[str, str]] = []
@@ -62,5 +62,6 @@ def delete_paths_chunked(
         skipped.extend(part["skipped"])
         if on_progress:
             done = min(i + len(chunk), n)
-            on_progress(done, n, len(deleted), len(failed), len(skipped))
+            last_path = str(chunk[-1]) if chunk else ""
+            on_progress(done, n, len(deleted), len(failed), len(skipped), last_path)
     return {"deleted": deleted, "failed": failed, "skipped": skipped}

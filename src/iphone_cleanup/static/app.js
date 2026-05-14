@@ -20,6 +20,113 @@ function formatHumanBytes(bytes) {
   return `${v < 10 ? v.toFixed(1) : Math.round(v)} ${label}`;
 }
 
+function scrollToLiveProgress() {
+  const hub = document.getElementById("activityHub");
+  if (hub) hub.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function fmtEpochSeconds(ts) {
+  if (typeof ts !== "number" || !Number.isFinite(ts)) return "—";
+  try {
+    return new Date(ts * 1000).toISOString();
+  } catch {
+    return String(ts);
+  }
+}
+
+/** Snapshot of session fields so the operator always sees what the server thinks is true. */
+function renderActivityDiagnostics(s) {
+  const el = document.getElementById("activityDiagnostics");
+  if (!el) return;
+  const fz =
+    typeof s.fuzzy_roll_total === "number"
+      ? `${s.fuzzy_roll_next_start ?? 0}/${s.fuzzy_roll_total}`
+      : "n/a";
+  const lines = [
+    `BROWSER_NOW_UTC ${new Date().toISOString()}`,
+    `PHASE ${s.phase || "—"} | scan_cancel_pending=${Boolean(s.scan_cancel_pending)} | duplicate_groups=${s.group_count ?? "—"}`,
+    `MOUNT mount_path=${s.mount_path || "—"}`,
+    `MOUNT mount_udid=${s.mount_udid || "—"}`,
+    `FUZZY_ROLL next/total=${fz} | exhausted=${Boolean(s.fuzzy_roll_exhausted)} | batch_size=${s.fuzzy_roll_batch_size ?? "—"}`,
+    `KEEP_MODE ${s.keep_mode || "—"} | scan_artifact_path=${s.scan_artifact_path || "—"}`,
+  ];
+  if (s.last_error) lines.push(`LAST_ERROR ${s.last_error}`);
+  const jobs = s.jobs || [];
+  if (jobs.length) {
+    lines.push(`JOBS (${jobs.length})`);
+    for (const j of jobs) {
+      const run = j.running ? "RUNNING" : "idle";
+      lines.push(
+        `  - ${run} id=${j.job_id} kind=${j.kind} | ${j.label || ""} | msg=${j.message || ""} | ` +
+          `prog=${j.progress_current ?? "—"}/${j.progress_total ?? "—"} | started=${fmtEpochSeconds(j.started_at)} | finished=${fmtEpochSeconds(j.finished_at)}`,
+      );
+    }
+  } else {
+    lines.push("JOBS none in snapshot");
+  }
+  el.textContent = lines.join("\n");
+}
+
+/** Renders per-job progress bars and the rolling activity log from `/api/status` / SSE. */
+function renderActivityHub(s) {
+  const jobsEl = document.getElementById("activityJobs");
+  const logEl = document.getElementById("activityLog");
+  if (!jobsEl || !logEl) return;
+  const jobs = (s.jobs || []).filter((j) => j.running);
+  jobsEl.innerHTML = "";
+  if (jobs.length === 0) {
+    const idle = document.createElement("p");
+    idle.className = "muted activity-idle-msg";
+    idle.style.margin = "0";
+    idle.style.fontSize = "0.88rem";
+    idle.textContent =
+      "No background job is running right now. When you mount, scan, delete, or move documents, a labeled job " +
+      "appears here with a progress bar and a detailed status line. The log below records every step with timestamps.";
+    jobsEl.appendChild(idle);
+  } else {
+    for (const j of jobs) {
+      const wrap = document.createElement("div");
+      wrap.className = "activity-job";
+      const title = document.createElement("div");
+      title.className = "activity-job-label";
+      title.textContent = `${j.label || j.kind || "Working…"} (${j.kind || "job"})`;
+      const barHost = document.createElement("div");
+      barHost.className = "progress-host";
+      const inner = document.createElement("div");
+      inner.className = "progress-bar-inner";
+      const tc = j.progress_total;
+      const cur = j.progress_current;
+      if (typeof tc === "number" && tc > 0 && typeof cur === "number") {
+        const pct = Math.min(100, Math.max(0, (100 * cur) / tc));
+        inner.style.width = `${pct}%`;
+      } else {
+        inner.classList.add("indeterminate");
+      }
+      barHost.appendChild(inner);
+      const row = document.createElement("div");
+      row.className = "activity-job-msg";
+      row.textContent = j.message || "…";
+      const det = document.createElement("div");
+      det.className = "activity-job-details";
+      const pctStr =
+        typeof tc === "number" && tc > 0 && typeof cur === "number"
+          ? `${Math.min(100, Math.max(0, (100 * cur) / tc)).toFixed(1)}%`
+          : "n/a (no numeric progress yet)";
+      det.textContent = `job_id=${j.job_id || "—"} | kind=${j.kind || "—"} | started_utc=${fmtEpochSeconds(j.started_at)} | progress_count=${cur ?? "—"}/${tc ?? "—"} (${pctStr})`;
+      wrap.appendChild(title);
+      wrap.appendChild(barHost);
+      wrap.appendChild(row);
+      wrap.appendChild(det);
+      jobsEl.appendChild(wrap);
+    }
+  }
+  const lines = s.activity_log || [];
+  logEl.textContent = lines.length
+    ? lines.join("\n")
+    : "No log lines yet — they appear here as the server reports each step (mount, scan, delete, documents).";
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
 function clearThumbStrip(el) {
   el.innerHTML = "";
 }
@@ -98,7 +205,7 @@ async function runDocPanelPreview() {
     return;
   }
   const ph = document.getElementById("phase")?.textContent || "";
-  if (ph === "deleting" || ph === "unmounting") return;
+  if (ph === "deleting" || ph === "unmounting" || ph === "mounting") return;
   const scopeEl = document.querySelector('input[name="docScope"]:checked');
   const scope = scopeEl ? scopeEl.value : "older_than_90d";
   const vf = document.getElementById("docVisualFallback")?.checked ?? false;
@@ -241,7 +348,7 @@ function updateDupReviewTeaser(s) {
     el.textContent = "Mount the iPhone to run a duplicate scan and open the review panel.";
   } else if (phase === "scanning") {
     el.textContent =
-      "Scan in progress — Cancel in step 3, or Unmount in step 6 to disconnect (both stop the scan). Open the panel to review any groups from the last finished scan; the list refreshes when this run completes.";
+      "Scan in progress — watch the live progress strip at the top for the current file; you can Cancel in step 3 or Unmount in step 6.";
   } else if (gc === 0) {
     el.textContent =
       "No duplicate groups loaded yet. Use step 3 to scan (optional), or go straight to document cleanup in step 5.";
@@ -294,11 +401,14 @@ function updateGuidedUI(s) {
   if (!trusted) {
     next = "Connect USB, unlock the iPhone, tap Trust if asked, then check the device.";
   } else if (!hasMount) {
-    next = "Mount iPhone media so this Mac can read your library.";
-  } else     if (phase === "scanning") {
-      next = cancelPending
-        ? "Stop requested — the scan exits quickly between photos; when the phase shows Mounted or Reviewing again, you can start another scan, use document cleanup, or unmount."
-        : "Scan running — use Cancel scan in step 3 to stop, or use Unmount in step 6 anytime to disconnect (that also cancels the scan). Document cleanup is available when the phase is not scanning.";
+    next =
+      phase === "mounting"
+        ? "Mounting — watch the live progress strip and activity log at the top of the page."
+        : "Mount iPhone media so this Mac can read your library.";
+  } else if (phase === "scanning") {
+    next = cancelPending
+      ? "Stop requested — the scan exits quickly between photos; when the phase shows Mounted or Reviewing again, you can start another scan, use document cleanup, or unmount."
+      : "Scan running — live file-by-file progress is at the top. Use Cancel scan in step 3 to stop, or Unmount in step 6 to disconnect (that also cancels the scan).";
   } else if (phase === "mounted") {
     next =
       "Optional: run an exact duplicate scan or a fuzzy roll scan, or scroll down for document cleanup. Unmount before unplugging.";
@@ -311,7 +421,7 @@ function updateGuidedUI(s) {
     }
   } else if (phase === "deleting") {
     next =
-      "Deletion running — watch Background work. Unmount in step 6 stays available if you need to disconnect (close Finder windows on the iPhone volume first; if the volume is busy, wait a moment and retry).";
+      "Deletion running — watch the live progress strip at the top. Unmount in step 6 stays available if you need to disconnect (close Finder windows on the iPhone volume first; if the volume is busy, wait a moment and retry).";
   } else if (phase === "unmounting") {
     next = "Unmounting…";
   } else if (hasMount) {
@@ -321,8 +431,10 @@ function updateGuidedUI(s) {
   }
   na.textContent = next;
 
-  const canStartScan = hasMount && (phase === "mounted" || phase === "reviewing") && phase !== "scanning";
-  const mountBusy = phase === "scanning" || phase === "deleting" || phase === "unmounting";
+  const canStartScan =
+    hasMount && (phase === "mounted" || phase === "reviewing") && phase !== "scanning";
+  const mountBusy =
+    phase === "mounting" || phase === "scanning" || phase === "deleting" || phase === "unmounting";
   document.getElementById("btnMount").disabled = !trusted || mountBusy;
   document.getElementById("btnScan").disabled = !canStartScan;
   const fuzzyBtn = document.getElementById("btnScanFuzzy");
@@ -335,13 +447,27 @@ function updateGuidedUI(s) {
 
   const scanRunHint = document.getElementById("scanRunHint");
   if (scanRunHint) {
-    if (phase === "scanning") {
+    if (phase === "mounting") {
+      scanRunHint.textContent =
+        "Mount in progress — duplicate scans stay disabled until the phase shows Mounted.";
+    } else if (phase === "scanning") {
       scanRunHint.textContent = cancelPending
         ? "Stop requested — the worker checks often between photos and filesystem steps, so this usually clears in a moment."
         : "Only one scan runs at a time (exact or fuzzy). Starting the other mode cancels the current run; Cancel stops without starting another.";
     } else if (phase === "mounted" || phase === "reviewing") {
+      const bs = typeof s.fuzzy_roll_batch_size === "number" ? s.fuzzy_roll_batch_size : 1000;
+      const fzTotal = typeof s.fuzzy_roll_total === "number" ? s.fuzzy_roll_total : null;
+      const fzNext = typeof s.fuzzy_roll_next_start === "number" ? s.fuzzy_roll_next_start : 0;
+      const fzEx = Boolean(s.fuzzy_roll_exhausted);
+      let fuzzyExtra = "";
+      if (fzTotal != null && fzTotal > 0) {
+        fuzzyExtra = fzEx
+          ? ` Fuzzy: finished all ${fzTotal} indexed photos in slices of ~${bs}; use API ?kind=fuzzy&fuzzy_restart=true to clear fuzzy groups and start over from the top (reuses cached hashes).`
+          : ` Fuzzy: next batch starts at photo index ${fzNext} of ${fzTotal} (~${bs} per run).`;
+      }
       scanRunHint.textContent =
-        "Exact = same-size near-identical dupes. Fuzzy = similar shots next to each other in capture-time order (bursts). Fuzzy defaults to keeping images with the most detected eyes when MediaPipe is installed.";
+        `Exact = same-size near-identical dupes. Fuzzy roll = similar adjacent shots in capture-time order, ~${bs} photos hashed/analyzed per click; hashes persist between runs.` +
+        fuzzyExtra;
     } else {
       scanRunHint.textContent = "";
     }
@@ -349,7 +475,8 @@ function updateGuidedUI(s) {
 
   const dupOpen = document.getElementById("btnDupReviewOpen");
   if (dupOpen) {
-    dupOpen.disabled = !hasMount || phase === "deleting" || phase === "unmounting";
+    dupOpen.disabled =
+      !hasMount || phase === "deleting" || phase === "unmounting" || phase === "mounting";
   }
 
   const mountNeeded = !hasMount;
@@ -360,16 +487,17 @@ function updateGuidedUI(s) {
     document.getElementById(id).disabled = mountNeeded;
   });
   document.getElementById("btnDelete").disabled =
-    mountNeeded || gc === 0 || phase === "scanning" || phase === "deleting";
+    mountNeeded || gc === 0 || phase === "scanning" || phase === "deleting" || phase === "mounting";
   const suggest = document.getElementById("btnSuggestKeepers");
   if (suggest) {
     const km = s.keep_mode || document.querySelector('input[name="keepMode"]:checked')?.value || "manual";
     const manual = km === "manual";
     suggest.classList.toggle("hidden", !(manual && hasMount && gc > 0));
-    suggest.disabled = mountNeeded || gc === 0 || phase === "scanning" || phase === "deleting";
+    suggest.disabled =
+      mountNeeded || gc === 0 || phase === "scanning" || phase === "deleting" || phase === "mounting";
   }
   document.querySelectorAll('input[name="keepMode"]').forEach((r) => {
-    r.disabled = mountNeeded || phase === "scanning" || phase === "deleting";
+    r.disabled = mountNeeded || phase === "scanning" || phase === "deleting" || phase === "mounting";
   });
 }
 
@@ -379,21 +507,6 @@ function relPath(fullPath, mount) {
   if (!fullPath.startsWith(m)) return "";
   const rest = fullPath.slice(m.length);
   return rest.startsWith("/") ? rest.slice(1) : rest;
-}
-
-function updateWorking(snapshot) {
-  const box = document.getElementById("working");
-  const txt = document.getElementById("workingText");
-  const jobs = snapshot.jobs || [];
-  const active = jobs.filter((j) => j.running);
-  if (active.length === 0) {
-    box.classList.add("hidden");
-    txt.textContent = "Idle";
-    return;
-  }
-  box.classList.remove("hidden");
-  const parts = active.map((j) => `${j.label}: ${j.message || "…"}`);
-  txt.textContent = parts.join(" · ");
 }
 
 function updateLastDelete(ledger) {
@@ -470,7 +583,8 @@ function applySnapshot(s) {
   updateLastDelete(s.last_delete_ledger);
   updateDocumentBatchInfo(s);
   updateDocumentLedger(s);
-  updateWorking(s);
+  renderActivityHub(s);
+  renderActivityDiagnostics(s);
   updateDupReviewTeaser(s);
   if (s.phase && s.phase !== lastPhase) {
     if (s.phase === "mounted") toast("iPhone media mounted.");
@@ -480,7 +594,7 @@ function applySnapshot(s) {
   updateGuidedUI(s);
 
   const phase = s.phase || "";
-  if (mp && phase !== "deleting" && phase !== "unmounting") {
+  if (mp && phase !== "deleting" && phase !== "unmounting" && phase !== "mounting") {
     scheduleDocPanelPreview();
   }
 }
@@ -603,7 +717,20 @@ async function refreshStatusFromServer() {
 function wireButtons() {
   wireStepJumps();
 
+  document.getElementById("btnActivityLogClear")?.addEventListener("click", async () => {
+    scrollToLiveProgress();
+    const res = await fetch("/api/activity-log/clear", { method: "POST" });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      toast(`Clear activity log failed: ${typeof j.detail === "string" ? j.detail : res.status}`);
+      return;
+    }
+    toast(j.message || "Activity log cleared.");
+    await refreshStatusFromServer();
+  });
+
   document.getElementById("btnDevice").addEventListener("click", async () => {
+    scrollToLiveProgress();
     toast("Checking USB device…");
     const res = await fetch("/api/device");
     const j = await res.json();
@@ -612,13 +739,21 @@ function wireButtons() {
     await refreshStatusFromServer();
   });
   document.getElementById("btnMount").addEventListener("click", async () => {
-    toast("Mounting (may take a few seconds)…");
+    scrollToLiveProgress();
+    toast("Mount started — live updates appear at the top of the page.");
     const res = await fetch("/api/mount", { method: "POST" });
     const j = await res.json().catch(() => ({}));
-    if (!res.ok) toast(`Mount failed: ${j.detail || res.status}`);
+    if (res.status === 409) {
+      toast(typeof j.detail === "string" ? j.detail : "Mount already in progress.");
+    } else if (!res.ok) {
+      toast(`Mount failed: ${j.detail || res.status}`);
+    } else if (!j.started) {
+      toast(j.message || "Mounted.");
+    }
     await refreshStatusFromServer();
   });
   document.getElementById("btnUnmount").addEventListener("click", async () => {
+    scrollToLiveProgress();
     toast("Unmounting — close Finder windows pointing at the mount first.");
     const res = await fetch("/api/unmount", { method: "POST" });
     const j = await res.json().catch(() => ({}));
@@ -627,6 +762,7 @@ function wireButtons() {
     await refreshStatusFromServer();
   });
   async function postScanStart(kind) {
+    scrollToLiveProgress();
     const q = kind === "fuzzy" ? "?kind=fuzzy" : "?kind=exact";
     const res = await fetch(`/api/scan/start${q}`, { method: "POST" });
     const j = await res.json().catch(() => ({}));
@@ -636,7 +772,7 @@ function wireButtons() {
     } else if (!res.ok) {
       toast(`Scan rejected: ${detail || res.status}`);
     } else {
-      toast(j.message || "Scan started — watch Background work.");
+      toast(j.message || "Scan started — watch live progress at the top.");
     }
   }
   document.getElementById("btnScan").addEventListener("click", () => postScanStart("exact"));
@@ -664,6 +800,7 @@ function wireButtons() {
     });
   });
   document.getElementById("btnSuggestKeepers").addEventListener("click", async () => {
+    scrollToLiveProgress();
     toast("Suggesting keepers (you stay in Manual mode)…");
     await fetch("/api/keep-mode", {
       method: "POST",
@@ -693,6 +830,7 @@ function wireButtons() {
   document.getElementById("btnCancelDelete").addEventListener("click", () => dlg.close());
   document.getElementById("btnConfirmDelete").addEventListener("click", async (e) => {
     e.preventDefault();
+    scrollToLiveProgress();
     const phrase = document.getElementById("confirmInput").value.trim();
     const res = await fetch("/api/delete", {
       method: "POST",
@@ -701,7 +839,7 @@ function wireButtons() {
     });
     const j = await res.json().catch(() => ({}));
     if (!res.ok) toast(`Delete blocked: ${j.detail || res.status}`);
-    else toast("Deleting — watch Background work.");
+    else toast("Deleting — watch live progress at the top.");
     dlg.close();
     document.getElementById("confirmInput").value = "";
   });
@@ -730,6 +868,7 @@ function wireButtons() {
   document.getElementById("btnDocCancel").addEventListener("click", () => dlgDoc.close());
   document.getElementById("btnDocConfirm").addEventListener("click", async (e) => {
     e.preventDefault();
+    scrollToLiveProgress();
     const scopeEl = document.querySelector('input[name="docScope"]:checked');
     const scope = scopeEl ? scopeEl.value : "older_than_90d";
     const include_visual_fallback = document.getElementById("docVisualFallback").checked;
@@ -744,7 +883,7 @@ function wireButtons() {
     else {
       lastDocPreviewKey = "";
       scheduleDocPanelPreview();
-      toast("Copying to Mac and removing from phone — watch Background work.");
+      toast("Copying to Mac and removing from phone — watch live progress at the top.");
     }
     dlgDoc.close();
     document.getElementById("docConfirmInput").value = "";

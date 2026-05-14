@@ -62,6 +62,7 @@ class Settings:
     phash_threshold: int
     fuzzy_phash_max_hamming: int
     fuzzy_phash_max_dim: int
+    fuzzy_roll_batch_size: int
     log_level: str
 
     @staticmethod
@@ -103,5 +104,6 @@ class Settings:
             phash_threshold=int(dup.get("phash_threshold") or 6),
             fuzzy_phash_max_hamming=int(dup.get("fuzzy_phash_max_hamming") or 12),
             fuzzy_phash_max_dim=int(dup.get("fuzzy_phash_max_dim") or 128),
+            fuzzy_roll_batch_size=int(dup.get("fuzzy_roll_batch_size") or 1000),
             log_level=str(logging.get("level") or "INFO"),
         )
