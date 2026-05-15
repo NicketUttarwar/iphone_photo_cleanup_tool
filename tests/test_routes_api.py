@@ -228,11 +228,11 @@ def test_scan_and_groups_flow(test_client, app_ctx, settings):
     gr = test_client.get("/api/scan/groups")
     assert gr.status_code == 200
     data = gr.json()
-    assert data["keep_mode"] == "manual"
+    assert data["keep_mode"] == "auto_best"
     assert len(data["groups"]) >= 1
 
 
-def test_keep_mode_and_selection(test_client, app_ctx, settings):
+def test_selection_after_groups_loaded(test_client, app_ctx, settings):
     mount_root = settings.mount_point
     _write_dup_mount(mount_root)
     app_ctx.state.set_phase(Phase.reviewing)
@@ -241,8 +241,6 @@ def test_keep_mode_and_selection(test_client, app_ctx, settings):
     gid = "g_test_1"
     app_ctx.state.duplicate_groups = [{"id": gid, "paths": [p1, p2], "recommendedKeep": p1, "recommendedKeeps": [p1]}]
     app_ctx.state.group_keep = {gid: [p1]}
-    r = test_client.post("/api/keep-mode", json={"mode": "manual"})
-    assert r.status_code == 200
     sel = test_client.post("/api/selection", json={"group_id": gid, "keep_path": p2})
     assert sel.status_code == 200
     assert app_ctx.state.group_keep[gid] == [p2]
@@ -385,6 +383,22 @@ def test_thumbnail_ok(test_client, app_ctx, settings):
     Image.new("RGB", (20, 20), "cyan").save(full, "JPEG")
     app_ctx.state.mount_path = mount_root.resolve()
     r = test_client.get("/api/thumbnail", params={"relpath": str(rel).replace(chr(92), "/")})
+    assert r.status_code == 200
+    assert r.headers.get("content-type", "").startswith("image/")
+
+
+def test_thumbnail_ok_with_custom_max_edge(test_client, app_ctx, settings):
+    mount_root = settings.mount_point
+    mount_root.mkdir(parents=True, exist_ok=True)
+    rel = Path("sub") / "big.jpg"
+    full = mount_root / rel
+    full.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (400, 300), "magenta").save(full, "JPEG")
+    app_ctx.state.mount_path = mount_root.resolve()
+    r = test_client.get(
+        "/api/thumbnail",
+        params={"relpath": str(rel).replace(chr(92), "/"), "max_edge": 128},
+    )
     assert r.status_code == 200
     assert r.headers.get("content-type", "").startswith("image/")
 

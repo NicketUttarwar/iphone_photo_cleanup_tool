@@ -28,7 +28,6 @@ ui:
   sse_poll_interval_ms: 800
 
 duplicates:
-  keep_mode: manual
   auto_best:
     face_eye: false
     face_eye_max_images_per_group: 6

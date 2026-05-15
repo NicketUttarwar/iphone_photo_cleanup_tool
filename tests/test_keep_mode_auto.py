@@ -1,4 +1,4 @@
-"""Keep-mode API with auto_best (uses auto_best.pick_recommended)."""
+"""Automatic keeper picks (_apply_auto_groups)."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from pathlib import Path
 
 from PIL import Image
 
+from iphone_cleanup.api.routes import _apply_auto_groups
 from iphone_cleanup.state import Phase
 
 
@@ -17,7 +18,7 @@ def _write_dup_mount(mount: Path) -> None:
         img.save(dcim / n, "JPEG", quality=90)
 
 
-def test_keep_mode_auto_best_updates_recommendations(test_client, app_ctx, settings):
+def test_apply_auto_groups_updates_exact_duplicate_keepers(app_ctx, settings):
     mount_root = settings.mount_point
     _write_dup_mount(mount_root)
     p1 = str((mount_root / "DCIM" / "a.jpg").resolve())
@@ -25,10 +26,17 @@ def test_keep_mode_auto_best_updates_recommendations(test_client, app_ctx, setti
     gid = "g_auto"
     app_ctx.state.set_phase(Phase.reviewing)
     app_ctx.state.mount_path = mount_root.resolve()
-    app_ctx.state.duplicate_groups = [{"id": gid, "paths": [p1, p2], "recommendedKeep": p1, "recommendedKeeps": [p1]}]
+    app_ctx.state.duplicate_groups = [
+        {
+            "id": gid,
+            "paths": [p1, p2],
+            "recommendedKeep": p1,
+            "recommendedKeeps": [p1],
+            "scan_kind": "exact",
+        }
+    ]
     app_ctx.state.group_keep = {gid: [p1]}
-    r = test_client.post("/api/keep-mode", json={"mode": "auto_best"})
-    assert r.status_code == 200
-    assert app_ctx.effective_keep_mode() == "auto_best"
+    _apply_auto_groups(app_ctx)
     rec = next(g["recommendedKeep"] for g in app_ctx.state.duplicate_groups if g["id"] == gid)
     assert rec in (p1, p2)
+    assert isinstance(app_ctx.state.group_keep.get(gid), list)

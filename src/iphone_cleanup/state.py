@@ -65,7 +65,6 @@ class AppState:
     group_keep: dict[str, list[str]] = field(default_factory=dict)
     jobs: dict[str, JobStatus] = field(default_factory=dict)
     event_seq: int = 0
-    runtime_keep_mode: str | None = None
     scan_cancel_event: threading.Event = field(default_factory=threading.Event)
     scan_cancel_requested: bool = False
     # Fuzzy roll: next slice start index into the cached sorted library; total filled after first batch load.

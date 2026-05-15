@@ -24,13 +24,3 @@ def load_ui_state(settings: Settings) -> dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
-
-
-def save_keep_mode(settings: Settings, mode: str) -> None:
-    if mode not in ("manual", "auto_best"):
-        return
-    settings.data_dir.mkdir(parents=True, exist_ok=True)
-    path = _path(settings)
-    prev = load_ui_state(settings)
-    prev["keep_mode"] = mode
-    path.write_text(json.dumps(prev, indent=2), encoding="utf-8")

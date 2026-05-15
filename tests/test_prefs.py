@@ -24,15 +24,3 @@ def test_load_ui_state_not_dict(settings: Settings):
     p = settings.data_dir / "ui_state.json"
     p.write_text(json.dumps([1, 2]), encoding="utf-8")
     assert prefs.load_ui_state(settings) == {}
-
-
-def test_save_keep_mode_roundtrip(settings: Settings):
-    prefs.save_keep_mode(settings, "manual")
-    assert prefs.load_ui_state(settings).get("keep_mode") == "manual"
-    prefs.save_keep_mode(settings, "auto_best")
-    assert prefs.load_ui_state(settings).get("keep_mode") == "auto_best"
-
-
-def test_save_keep_mode_invalid_ignored(settings: Settings):
-    prefs.save_keep_mode(settings, "bogus")
-    assert "keep_mode" not in prefs.load_ui_state(settings)

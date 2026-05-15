@@ -151,3 +151,68 @@ def test_walk_images_filters_extensions(tmp_path: Path):
     files = scan._walk_images(root)
     assert len(files) == 1
     assert files[0].suffix.lower() == ".jpg"
+
+
+def test_walk_images_dcim_only_when_present(tmp_path: Path):
+    mount = tmp_path / "iphone"
+    dcim = mount / "DCIM" / "100APPLE"
+    other = mount / "Downloads"
+    dcim.mkdir(parents=True)
+    other.mkdir(parents=True)
+    (dcim / "roll.jpg").write_bytes(b"")
+    (other / "outside.jpg").write_bytes(b"")
+    files = scan._walk_images(mount)
+    assert len(files) == 1
+    assert files[0].name == "roll.jpg"
+
+
+def test_walk_images_dedupes_heif_and_jpeg_same_stem(tmp_path: Path):
+    roll = tmp_path / "roll"
+    roll.mkdir()
+    (roll / "IMG_0001.heic").write_bytes(b"h")
+    (roll / "IMG_0001.jpg").write_bytes(b"j")
+    files = scan._walk_images(roll)
+    assert len(files) == 1
+    assert files[0].suffix.lower() == ".heic"
+
+
+def test_fuzzy_roll_batch_invalidates_old_cache_version(tmp_path: Path):
+    d = tmp_path / "roll"
+    d.mkdir()
+    img = Image.new("RGB", (48, 36), color=(90, 120, 200))
+    for name in ("a.jpg", "b.jpg"):
+        img.save(d / name, "JPEG", quality=93)
+    scan_root = tmp_path / "scans"
+    udid = "v1cache"
+    cache_path = scan.fuzzy_roll_cache_path(scan_root, udid, d.resolve())
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "mount_root": str(d.resolve()),
+                "mount_udid": udid,
+                "phash_max_dim": 96,
+                "max_adjacent_hamming": 14,
+                "paths": [],
+                "hashes": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    g, next_idx, total = scan.run_fuzzy_roll_scan_batch(
+        d,
+        scan_artifacts_dir=scan_root,
+        mount_udid=udid,
+        batch_start=0,
+        batch_size=10,
+        phash_max_dim=96,
+        max_adjacent_hamming=14,
+        progress_callback=None,
+        cancel_event=None,
+    )
+    assert total == 2
+    assert next_idx == 2
+    loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert loaded.get("version") == 2
+    assert isinstance(g, list)

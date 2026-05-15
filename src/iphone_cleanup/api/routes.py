@@ -15,7 +15,7 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from iphone_cleanup import auto_best, delete as delmod, device_bridge, documents, group_keep_util, mount, prefs, scan, thumbnails
+from iphone_cleanup import auto_best, delete as delmod, device_bridge, documents, group_keep_util, mount, scan, thumbnails
 from iphone_cleanup.app_context import AppCtx
 from iphone_cleanup.app_log import log_event
 from iphone_cleanup.state import Phase
@@ -101,11 +101,6 @@ def _run_mount_thread(ctx: AppCtx, job_id: str, udid: str | None) -> None:
         ctx.state.set_phase(Phase.device_detected)
         _touch(ctx)
         log_event("mount_error", job_id=job_id, error=str(e))
-
-
-class KeepModeBody(BaseModel):
-    mode: Literal["manual", "auto_best"]
-    apply_auto: bool = False
 
 
 class SelectionBody(BaseModel):
@@ -382,13 +377,11 @@ def _strip_fuzzy_groups(ctx: AppCtx) -> None:
             ctx.state.group_keep.pop(oid, None)
 
 
-def _apply_auto_groups(ctx: AppCtx, *, force: bool = False) -> None:
+def _apply_auto_groups(ctx: AppCtx) -> None:
     root = ctx.state.mount_path
     if not root:
         return
-    face = ctx.settings.duplicates_auto_face_eye and (
-        ctx.effective_keep_mode() == "auto_best" or force
-    )
+    face = ctx.settings.duplicates_auto_face_eye
     max_img = ctx.settings.duplicates_face_eye_max_images
     for g in ctx.state.duplicate_groups:
         paths = list(g.get("paths") or [])
@@ -505,15 +498,7 @@ def _run_scan_thread(
                 ctx.state.fuzzy_roll_total = None
             ctx.state.duplicate_groups = groups
             ctx.state.group_keep = {}
-            for g in groups:
-                gid = str(g["id"])
-                paths = list(g.get("paths") or [])
-                if not paths:
-                    continue
-                kps = [str(g.get("recommendedKeep") or paths[0])]
-                g["recommendedKeeps"] = list(kps)
-                g["recommendedKeep"] = kps[0]
-                ctx.state.group_keep[gid] = list(kps)
+            _apply_auto_groups(ctx)
         else:
             ctx.state.duplicate_groups = list(ctx.state.duplicate_groups) + groups
             for g in groups:
@@ -525,8 +510,6 @@ def _run_scan_thread(
                 g["recommendedKeeps"] = list(kps)
                 g["recommendedKeep"] = kps[0]
                 ctx.state.group_keep[gid] = list(kps)
-        if ctx.effective_keep_mode() == "auto_best":
-            _apply_auto_groups(ctx, force=False)
         art = ctx.settings.scan_artifacts_dir / f"scan_{int(time.time())}_{uuid.uuid4().hex[:8]}.json"
         scan.write_artifact(art, groups, scan_kind="fuzzy" if scan_kind == "fuzzy" else None)
         ctx.state.scan_artifact_path = art
@@ -662,19 +645,6 @@ def api_scan_cancel(request: Request) -> dict[str, Any]:
 def api_scan_groups(request: Request) -> dict[str, Any]:
     ctx = _ctx(request)
     return {"groups": ctx.state.duplicate_groups, "keep": ctx.state.group_keep, "keep_mode": ctx.effective_keep_mode()}
-
-
-@router.post("/api/keep-mode")
-def api_keep_mode(body: KeepModeBody, request: Request) -> dict[str, Any]:
-    ctx = _ctx(request)
-    ctx.state.runtime_keep_mode = body.mode
-    prefs.save_keep_mode(ctx.settings, body.mode)
-    if body.mode == "auto_best":
-        _apply_auto_groups(ctx, force=False)
-    elif body.apply_auto:
-        _apply_auto_groups(ctx, force=True)
-    _touch(ctx)
-    return {"ok": True, "keep_mode": ctx.effective_keep_mode()}
 
 
 @router.post("/api/selection")
@@ -1086,7 +1056,16 @@ def api_documents_finalize(body: DocumentBatchBody, request: Request) -> dict[st
 
 
 @router.get("/api/thumbnail")
-def api_thumbnail(relpath: str, request: Request) -> Any:
+def api_thumbnail(
+    relpath: str,
+    request: Request,
+    max_edge: Optional[int] = Query(
+        None,
+        ge=64,
+        le=768,
+        description="Optional longer edge for thumbnails (duplicate review uses a larger value).",
+    ),
+) -> Any:
     from fastapi.responses import Response
 
     ctx = _ctx(request)
@@ -1102,13 +1081,14 @@ def api_thumbnail(relpath: str, request: Request) -> Any:
         raise HTTPException(400, "Outside mount.")
     if not full.is_file():
         raise HTTPException(404, "Not found.")
+    edge = int(max_edge) if max_edge is not None else ctx.settings.thumbnail_max_edge
     ctx.thumb_semaphore.acquire()
     try:
         data = thumbnails.get_thumbnail_jpeg(
             full,
             root.resolve(),
             ctx.settings.thumbnail_cache_dir,
-            ctx.settings.thumbnail_max_edge,
+            edge,
             ctx.settings.thumbnail_jpeg_quality,
             ctx.settings.thumbnail_cache_max_mb,
         )

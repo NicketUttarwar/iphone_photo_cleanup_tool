@@ -53,7 +53,6 @@
     <div><strong>Phase:</strong> <span id="phase">…</span></div>
     <div><strong>Device:</strong> <span id="device">unknown</span></div>
     <div><strong>Mount:</strong> <span id="mount">—</span></div>
-    <div><strong>Keep mode:</strong> <span id="keepMode">—</span></div>
   </section>
 
   <p id="nextAction" class="next-action" aria-live="polite"></p>
@@ -121,7 +120,7 @@
           <div class="step-content">
             <h3 class="step-title">Review duplicates &amp; delete extras</h3>
             <p class="step-text">
-              Tap thumbnails in the panel to toggle <strong>keep</strong> (blue ring + checkmark). You can keep several files per group; if every file in a group is marked keep, nothing is deleted there. <strong>Fuzzy</strong> bursts default to keeping images with the most detected eyes when MediaPipe is installed (see optional requirements). Tap this card to scroll to the duplicate summary.
+              Open duplicate review to see suggested keepers (auto-ranked). Tap thumbnails to toggle <strong>keep</strong> (multiple allowed); if every file in a group is kept, nothing is deleted there. <strong>Fuzzy</strong> bursts use approximate eye counts when MediaPipe is installed (see optional requirements). Tap this card to scroll to the duplicate summary.
             </p>
             <div class="step-jump-hint" aria-hidden="true">Scroll to duplicate summary ↓</div>
           </div>
@@ -165,7 +164,7 @@
     <div class="btn-row">
       <button type="button" id="btnDupReviewOpen" class="primary" disabled>Open duplicate review…</button>
     </div>
-    <p class="hint muted">Long duplicate lists open in a scrollable panel so steps 5–6 stay one short scroll away.</p>
+    <p class="hint muted">Opens a large overlay (almost full screen) with a scrollable list so you can compare photos comfortably.</p>
   </section>
 
   <dialog id="dlgDupReview" class="dup-review-dialog" aria-labelledby="dupPopoutHeading">
@@ -174,16 +173,8 @@
         <h3 id="dupPopoutHeading" class="dup-popout-title">Duplicate review</h3>
         <button type="button" id="btnDupReviewClose" class="ghost small-btn" aria-label="Close duplicate review panel">Close</button>
       </header>
-      <div class="btn-row keep-mode-row dup-popout-keep-row">
-        <span class="keep-mode-label">Keeper choice:</span>
-        <label class="inline"><input type="radio" name="keepMode" value="manual" checked /> Manual (tap a photo per group)</label>
-        <label class="inline"><input type="radio" name="keepMode" value="auto_best" /> Auto best</label>
-        <button type="button" id="btnSuggestKeepers" class="ghost small-btn hidden" title="Fill keepers using auto ranking while staying in Manual mode">
-          Suggest keepers
-        </button>
-      </div>
       <p class="hint dup-popout-hint">
-        <strong>Manual:</strong> tap photos to toggle keep (multiple allowed). Use <strong>Keep all in group</strong> beside each heading to mark every file in that set at once, then tap any tile to remove keep from individual photos. <strong>Auto best</strong> re-ranks keepers (exact: sharpness/size/recency + optional face/eye; fuzzy: most approximate “eye” count via MediaPipe when available). Delete only removes files you did <em>not</em> mark keep. If every file in a group is kept, that group contributes nothing to delete.
+        <strong>Auto-ranked keepers:</strong> Exact duplicates use sharpness, resolution, and recency (plus optional face/eye when enabled in config). Fuzzy bursts favor approximate eye counts when MediaPipe is available. Tap photos to change keep marks (multiple per group). Use <strong>Keep all in group</strong> beside each heading to select every file at once, then tap tiles to remove keep where needed. Delete only removes files you did <em>not</em> mark keep. If every file in a group is kept, that group contributes nothing to delete.
       </p>
       <div id="groups" class="groups dup-popout-groups"></div>
       <footer class="dup-popout-footer btn-row">

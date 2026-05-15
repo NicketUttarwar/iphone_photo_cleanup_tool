@@ -38,7 +38,6 @@ def write_defaults_yaml(repo_root: Path) -> Path:
             "sse_poll_interval_ms": 200,
         },
         "duplicates": {
-            "keep_mode": "manual",
             "auto_best": {"face_eye": False, "face_eye_max_images_per_group": 2},
             "phash_threshold": 6,
             "fuzzy_phash_max_hamming": 12,

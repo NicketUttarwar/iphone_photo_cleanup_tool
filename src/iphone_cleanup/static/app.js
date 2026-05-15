@@ -48,7 +48,7 @@ function renderActivityDiagnostics(s) {
     `MOUNT mount_path=${s.mount_path || "—"}`,
     `MOUNT mount_udid=${s.mount_udid || "—"}`,
     `FUZZY_ROLL next/total=${fz} | exhausted=${Boolean(s.fuzzy_roll_exhausted)} | batch_size=${s.fuzzy_roll_batch_size ?? "—"}`,
-    `KEEP_MODE ${s.keep_mode || "—"} | scan_artifact_path=${s.scan_artifact_path || "—"}`,
+    `SCAN_ARTIFACT ${s.scan_artifact_path || "—"}`,
   ];
   if (s.last_error) lines.push(`LAST_ERROR ${s.last_error}`);
   const jobs = s.jobs || [];
@@ -353,7 +353,7 @@ function updateDupReviewTeaser(s) {
     el.textContent =
       "No duplicate groups loaded yet. Use step 3 to scan (optional), or go straight to document cleanup in step 5.";
   } else {
-    el.textContent = `${gc} duplicate group(s). Open the panel to compare thumbnails and pick keepers.`;
+    el.textContent = `${gc} duplicate group(s). Open the panel — keep marks start from auto-ranked picks; tap tiles to adjust.`;
   }
 }
 
@@ -415,7 +415,7 @@ function updateGuidedUI(s) {
   } else if (phase === "reviewing") {
     if (gc > 0) {
       next =
-        "Open duplicate review: toggle which files to keep (multiple per group). Delete only removes unmarked files. If every file in a group is kept, that group is skipped.";
+        "Open duplicate review: keep marks start from auto-ranked picks; tap tiles to change them (multiple per group). Delete only removes unmarked files. If every file in a group is kept, that group is skipped.";
     } else {
       next = "No groups from the last scan — document cleanup below is optional, then unmount when done.";
     }
@@ -488,17 +488,6 @@ function updateGuidedUI(s) {
   });
   document.getElementById("btnDelete").disabled =
     mountNeeded || gc === 0 || phase === "scanning" || phase === "deleting" || phase === "mounting";
-  const suggest = document.getElementById("btnSuggestKeepers");
-  if (suggest) {
-    const km = s.keep_mode || document.querySelector('input[name="keepMode"]:checked')?.value || "manual";
-    const manual = km === "manual";
-    suggest.classList.toggle("hidden", !(manual && hasMount && gc > 0));
-    suggest.disabled =
-      mountNeeded || gc === 0 || phase === "scanning" || phase === "deleting" || phase === "mounting";
-  }
-  document.querySelectorAll('input[name="keepMode"]').forEach((r) => {
-    r.disabled = mountNeeded || phase === "scanning" || phase === "deleting" || phase === "mounting";
-  });
 }
 
 function relPath(fullPath, mount) {
@@ -560,7 +549,6 @@ function applySnapshot(s) {
   lastDocumentBatches = s.document_batches || [];
 
   document.getElementById("phase").textContent = s.phase || "unknown";
-  document.getElementById("keepMode").textContent = s.keep_mode || "—";
   mountPath = s.mount_path || "";
   document.getElementById("mount").textContent = mountPath || "—";
   const dev = s.device;
@@ -575,10 +563,6 @@ function applySnapshot(s) {
     setBanner(s.last_error, true);
   } else {
     setBanner("", false);
-  }
-  if (s.keep_mode) {
-    const r = document.querySelector(`input[name="keepMode"][value="${s.keep_mode}"]`);
-    if (r) r.checked = true;
   }
   updateLastDelete(s.last_delete_ledger);
   updateDocumentBatchInfo(s);
@@ -662,7 +646,7 @@ async function loadGroups() {
       const img = document.createElement("img");
       img.loading = "lazy";
       if (rel) {
-        img.src = `/api/thumbnail?relpath=${encodeURIComponent(rel)}`;
+        img.src = `/api/thumbnail?relpath=${encodeURIComponent(rel)}&max_edge=512`;
       }
       img.alt = p.split("/").pop() || "photo";
       const cap = document.createElement("div");
@@ -786,30 +770,6 @@ function wireButtons() {
     }
     if (j.noop) toast(j.message || "No scan was running.");
     else toast(j.message || "Stop requested.");
-  });
-  document.querySelectorAll('input[name="keepMode"]').forEach((el) => {
-    el.addEventListener("change", async (ev) => {
-      const mode = ev.target.value;
-      await fetch("/api/keep-mode", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode, apply_auto: false }),
-      });
-      await loadGroups();
-      await refreshStatusFromServer();
-    });
-  });
-  document.getElementById("btnSuggestKeepers").addEventListener("click", async () => {
-    scrollToLiveProgress();
-    toast("Suggesting keepers (you stay in Manual mode)…");
-    await fetch("/api/keep-mode", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mode: "manual", apply_auto: true }),
-    });
-    await loadGroups();
-    await refreshStatusFromServer();
-    toast("Review the highlighted keepers before deleting.");
   });
   const dlgDup = document.getElementById("dlgDupReview");
   const openDupPanel = () => {

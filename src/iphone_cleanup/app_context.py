@@ -17,6 +17,5 @@ class AppCtx:
     thumb_semaphore: threading.BoundedSemaphore
 
     def effective_keep_mode(self) -> str:
-        if self.state.runtime_keep_mode:
-            return self.state.runtime_keep_mode
-        return self.settings.duplicates_keep_mode
+        """Compatibility shim for API payloads; keeper picks always start from auto ranking."""
+        return "auto_best"

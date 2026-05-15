@@ -56,7 +56,6 @@ class Settings:
     thumbnail_cache_max_mb: int
     max_concurrent_thumbnails: int
     sse_poll_interval_ms: int
-    duplicates_keep_mode: str
     duplicates_auto_face_eye: bool
     duplicates_face_eye_max_images: int
     phash_threshold: int
@@ -98,7 +97,6 @@ class Settings:
             thumbnail_cache_max_mb=int(ui.get("thumbnail_cache_max_mb") or 512),
             max_concurrent_thumbnails=int(ui.get("max_concurrent_thumbnails") or 3),
             sse_poll_interval_ms=int(ui.get("sse_poll_interval_ms") or 800),
-            duplicates_keep_mode=str(dup.get("keep_mode") or "manual"),
             duplicates_auto_face_eye=bool(auto.get("face_eye", False)),
             duplicates_face_eye_max_images=int(auto.get("face_eye_max_images_per_group") or 6),
             phash_threshold=int(dup.get("phash_threshold") or 6),

@@ -26,6 +26,63 @@ except Exception:
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".gif", ".webp"}
 
+# iPhone often stores the same capture as both HEIF (original) and a JPEG companion; keep HEIF only.
+_RAW_CAPTURE_EXTS = frozenset({".heic", ".heif"})
+_JPEG_DERIVED_EXTS = frozenset({".jpg", ".jpeg"})
+
+
+def _effective_dcim_scan_root(mount_root: Path) -> Path:
+    """Limit duplicate/fuzzy scans to Camera Roll (DCIM) when that folder exists on the mount."""
+    dcim = mount_root / "DCIM"
+    if dcim.is_dir():
+        return dcim.resolve()
+    return mount_root.resolve()
+
+
+def _dedupe_heif_jpeg_pairs(paths: list[Path]) -> list[Path]:
+    """
+    Drop JPEG companions when the same basename exists as HEIF in the same directory.
+
+    This avoids treating Apple's paired storage as fuzzy-roll or exact-scan duplicates.
+    """
+    if len(paths) < 2:
+        return paths
+    groups: dict[tuple[str, str], list[Path]] = defaultdict(list)
+    for p in paths:
+        key = (str(p.resolve().parent), p.stem.lower())
+        groups[key].append(p)
+
+    out: list[Path] = []
+    for bucket in groups.values():
+        if len(bucket) == 1:
+            out.extend(bucket)
+            continue
+        by_ext: dict[str, list[Path]] = defaultdict(list)
+        for p in bucket:
+            by_ext[p.suffix.lower()].append(p)
+
+        raw_paths: list[Path] = []
+        for ext in _RAW_CAPTURE_EXTS:
+            raw_paths.extend(by_ext.get(ext, []))
+        jpeg_paths: list[Path] = []
+        for ext in _JPEG_DERIVED_EXTS:
+            jpeg_paths.extend(by_ext.get(ext, []))
+
+        if raw_paths and jpeg_paths:
+            def _sz(pa: Path) -> int:
+                try:
+                    return pa.stat().st_size
+                except OSError:
+                    return 0
+
+            raw_paths.sort(key=_sz, reverse=True)
+            out.append(raw_paths[0])
+            continue
+
+        out.extend(bucket)
+
+    return out
+
 
 class ScanCancelled(Exception):
     """Raised when the operator cancels mid-scan; carries completed raw groups."""
@@ -50,19 +107,19 @@ def _walk_images(
     walk_progress_every: int = 320,
     walk_progress: Callable[[int, str], None] | None = None,
 ) -> list[Path]:
-    """Collect image paths under root; cooperatively cancel during large rglob walks."""
+    """Collect image paths under the mount's Camera Roll (DCIM) when present; cooperatively cancel."""
     out: list[Path] = []
     n = 0
-    root_r = root.resolve()
-    for p in root.rglob("*"):
+    root_r = _effective_dcim_scan_root(root)
+    for p in root_r.rglob("*"):
         n += 1
         if cancel_event and cancel_every > 0 and n % cancel_every == 0 and cancel_event.is_set():
             raise ScanCancelled([])
         if p.is_file() and p.suffix.lower() in IMAGE_EXTS:
             out.append(p)
             if walk_progress and len(out) % walk_progress_every == 0:
-                walk_progress(len(out), _rel_under_mount(root_r, p))
-    return out
+                walk_progress(len(out), _rel_under_mount(root.resolve(), p))
+    return _dedupe_heif_jpeg_pairs(out)
 
 
 def _phash(
@@ -226,7 +283,8 @@ def _save_fuzzy_roll_cache(
         else:
             serial_hashes.append(str(h))
     payload = {
-        "version": 1,
+        # Bump when manifest rules change (e.g. DCIM-only walk, HEIF/JPEG dedupe).
+        "version": 2,
         "mount_root": str(mount_root.resolve()),
         "mount_udid": mount_udid or "",
         "phash_max_dim": phash_max_dim,
@@ -245,6 +303,8 @@ def _cache_matches_mount(
     max_adjacent_hamming: int,
 ) -> bool:
     try:
+        if int(data.get("version") or 0) != 2:
+            return False
         return (
             str(data.get("mount_root") or "") == str(mount_root.resolve())
             and str(data.get("mount_udid") or "") == str(mount_udid or "")

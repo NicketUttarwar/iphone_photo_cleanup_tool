@@ -62,6 +62,5 @@ def test_settings_from_dict_defaults(repo_root: Path, defaults_path: Path):
     assert s.server_port == 18765
     assert s.data_dir == (repo_root / "_pytest_data/data").resolve()
     assert s.delete_chunk_size == 5
-    assert s.duplicates_keep_mode == "manual"
     assert s.duplicates_auto_face_eye is False
     assert s.phash_threshold == 6

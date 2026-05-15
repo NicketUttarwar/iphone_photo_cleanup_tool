@@ -11,7 +11,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from iphone_cleanup import mount, prefs
+from iphone_cleanup import mount
 from iphone_cleanup.api.routes import router
 from iphone_cleanup.app_context import AppCtx
 from iphone_cleanup.app_log import log_event, setup_file_logging
@@ -28,9 +28,6 @@ def create_app(ctx: AppCtx) -> FastAPI:
         ctx.settings.mount_point.parent.mkdir(parents=True, exist_ok=True)
         setup_file_logging(ctx.settings.logs_dir, ctx.settings.log_level)
         log_event("server_start", host=ctx.settings.server_host, port=ctx.settings.server_port)
-        saved = prefs.load_ui_state(ctx.settings).get("keep_mode")
-        if saved in ("manual", "auto_best"):
-            ctx.state.runtime_keep_mode = saved
         url = f"http://{ctx.settings.server_host}:{ctx.settings.server_port}/"
         if ctx.settings.ui_open_browser and not ctx.no_open_browser:
 

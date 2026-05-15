@@ -66,7 +66,7 @@ Run these from anywhere; each script resolves the repo root unless you override 
 CONFIGURATION RULE
 ------------------
 All tunables are read from **`config/*.yaml`** and CLI flags passed by **`scripts/run.sh`** / **`python -m iphone_cleanup`**. The application does **not** read process environment variables for settings.
-The UI **manual / auto best** choice is also written to **`data/ui_state.json`** (under **`paths.data_dir`**, gitignored with **`data/`**) so it survives restarts; YAML **`duplicates.keep_mode`** still sets the default when no saved file exists.
+Duplicate groups always start from **auto-ranked keepers** (sharpness / resolution / recency for exact dupes; fuzzy bursts favor approximate eye counts when MediaPipe is enabled via **`duplicates.auto_best.face_eye`**). Tap thumbnails to override keep marks before deleting extras.
 
 
 GOAL (TARGET PRODUCT)
