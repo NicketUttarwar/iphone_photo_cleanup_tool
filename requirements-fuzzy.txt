@@ -1,0 +1,3 @@
+# Optional: LAB k-means palette assist (heavier). Core fuzzy roll works without this.
+# Install with: .venv/bin/pip install -r requirements-fuzzy.txt
+opencv-python-headless>=4.8.0

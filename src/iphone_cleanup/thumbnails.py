@@ -7,7 +7,7 @@ import io
 import os
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 try:
     import pillow_heif
@@ -87,6 +87,7 @@ def get_thumbnail_jpeg(
     if cache_path.is_file():
         return cache_path.read_bytes()
     with Image.open(source) as im:
+        im = ImageOps.exif_transpose(im)
         im = im.convert("RGB")
         im.thumbnail((max_edge, max_edge))
         buf = io.BytesIO()

@@ -15,6 +15,15 @@ import imagehash
 from PIL import Image
 
 from iphone_cleanup.auto_best import _exif_capture_ts
+from iphone_cleanup.fuzzy_palette import (
+    FuzzyFeatures,
+    FuzzyMatchConfig,
+    adjacent_fuzzy_link,
+    extract_fuzzy_features_from_path,
+    vote_chain_metadata,
+)
+
+FUZZY_CACHE_VERSION = 3
 
 try:
     import pillow_heif
@@ -104,7 +113,7 @@ def _walk_images(
     cancel_event: threading.Event | None = None,
     *,
     cancel_every: int = 256,
-    walk_progress_every: int = 320,
+    walk_progress_every: int = 250,
     walk_progress: Callable[[int, str], None] | None = None,
 ) -> list[Path]:
     """Collect image paths under the mount's Camera Roll (DCIM) when present; cooperatively cancel."""
@@ -163,9 +172,14 @@ def _union_find(n: int, pairs: list[tuple[int, int]]) -> list[int]:
     return [find(i) for i in range(n)]
 
 
-def finalize_groups(raw_groups: list[list[Path]], *, scan_kind: str) -> list[dict[str, Any]]:
+def finalize_groups(
+    raw_groups: list[list[Path]],
+    *,
+    scan_kind: str,
+    group_extras: list[dict[str, Any] | None] | None = None,
+) -> list[dict[str, Any]]:
     out_groups: list[dict[str, Any]] = []
-    for paths in raw_groups:
+    for gi, paths in enumerate(raw_groups):
         total = 0
         for p in paths:
             try:
@@ -184,16 +198,17 @@ def finalize_groups(raw_groups: list[list[Path]], *, scan_kind: str) -> list[dic
                 largest = p
         largest_s = str(Path(largest).resolve())
         gid = "g_" + uuid.uuid4().hex[:10]
-        out_groups.append(
-            {
-                "id": gid,
-                "paths": [str(Path(x).resolve()) for x in paths],
-                "bytesSavedIfOneKept": max(0, total - largest_sz),
-                "recommendedKeep": largest_s,
-                "recommendedKeeps": [largest_s],
-                "scan_kind": scan_kind,
-            }
-        )
+        row: dict[str, Any] = {
+            "id": gid,
+            "paths": [str(Path(x).resolve()) for x in paths],
+            "bytesSavedIfOneKept": max(0, total - largest_sz),
+            "recommendedKeep": largest_s,
+            "recommendedKeeps": [largest_s],
+            "scan_kind": scan_kind,
+        }
+        if group_extras and gi < len(group_extras) and group_extras[gi]:
+            row.update(group_extras[gi])
+        out_groups.append(row)
     return out_groups
 
 
@@ -209,26 +224,95 @@ def fuzzy_roll_cache_path(scan_artifacts_dir: Path, mount_udid: str | None, moun
     return (base / f"{safe_udid}_{root_tag}.json").resolve()
 
 
+def _default_fuzzy_match_config(phash_max_dim: int, max_adjacent_hamming: int) -> FuzzyMatchConfig:
+    return FuzzyMatchConfig(
+        phash_max_dim=phash_max_dim,
+        max_adjacent_hamming=max_adjacent_hamming,
+    )
+
+
+def _adjacent_fuzzy_linked(
+    features: list[FuzzyFeatures | None],
+    i: int,
+    j: int,
+    cfg: FuzzyMatchConfig,
+) -> tuple[bool, str, str]:
+    fa, fb = features[i], features[j]
+    if fa is None or fb is None:
+        return False, "", ""
+    return adjacent_fuzzy_link(fa, fb, cfg)
+
+
+def _fuzzy_burst_starts_in_window(
+    n: int,
+    features: list[FuzzyFeatures | None],
+    cfg: FuzzyMatchConfig,
+    cancel_check: Callable[[], None],
+    window_start: int,
+    window_end: int,
+) -> list[tuple[int, int, dict[str, Any]]]:
+    """Burst chains whose first index lies in [window_start, window_end)."""
+    ranges: list[tuple[int, int, dict[str, Any]]] = []
+    lo = max(0, min(window_start, n))
+    hi = max(lo, min(window_end, n))
+    for i in range(lo, hi):
+        cancel_check()
+        if i > 0 and _adjacent_fuzzy_linked(features, i - 1, i, cfg)[0]:
+            continue
+        j = i
+        link_reasons: list[str] = []
+        link_strengths: list[str] = []
+        while j + 1 < n:
+            cancel_check()
+            ok, reason, strength = _adjacent_fuzzy_linked(features, j, j + 1, cfg)
+            if not ok:
+                break
+            if reason:
+                link_reasons.append(reason)
+                link_strengths.append(strength)
+            j += 1
+        if j > i:
+            reason, strength = vote_chain_metadata(link_reasons, link_strengths)
+            ranges.append((i, j, {"fuzzy_match_reason": reason, "fuzzy_link_strength": strength}))
+    return ranges
+
+
+def _roll_sort_key(path: Path, *, use_exif: bool) -> tuple[Any, ...]:
+    """Fast mtime+path ordering for large libraries; optional full EXIF pass."""
+    if use_exif:
+        return (_exif_capture_ts(path), str(path))
+    try:
+        return (path.stat().st_mtime, str(path))
+    except OSError:
+        return (0.0, str(path))
+
+
 def _fuzzy_burst_index_ranges(
     n: int,
-    hashes: list[imagehash.ImageHash | None],
-    max_adjacent_hamming: int,
+    features: list[FuzzyFeatures | None],
+    cfg: FuzzyMatchConfig,
     cancel_check: Callable[[], None],
-) -> list[tuple[int, int]]:
-    """Maximal adjacent chains with length >= 2; each tuple is (start_idx, end_idx) inclusive."""
-    ranges: list[tuple[int, int]] = []
+) -> list[tuple[int, int, dict[str, Any]]]:
+    """Maximal adjacent chains with length >= 2."""
+    ranges: list[tuple[int, int, dict[str, Any]]] = []
     i = 0
     while i < n:
         cancel_check()
         j = i
+        link_reasons: list[str] = []
+        link_strengths: list[str] = []
         while j + 1 < n:
             cancel_check()
-            hi, hj = hashes[j], hashes[j + 1]
-            if hi is None or hj is None or (hi - hj) > max_adjacent_hamming:
+            ok, reason, strength = _adjacent_fuzzy_linked(features, j, j + 1, cfg)
+            if not ok:
                 break
+            if reason:
+                link_reasons.append(reason)
+                link_strengths.append(strength)
             j += 1
         if j > i:
-            ranges.append((i, j))
+            reason, strength = vote_chain_metadata(link_reasons, link_strengths)
+            ranges.append((i, j, {"fuzzy_match_reason": reason, "fuzzy_link_strength": strength}))
         i = j + 1
     return ranges
 
@@ -238,6 +322,18 @@ def _ranges_to_raw_groups(files: list[Path], ranges: list[tuple[int, int]]) -> l
     for a, b in ranges:
         out.append([Path(files[k]) for k in range(a, b + 1)])
     return out
+
+
+def _ranges_to_raw_groups_with_meta(
+    files: list[Path],
+    ranges: list[tuple[int, int, dict[str, Any]]],
+) -> tuple[list[list[Path]], list[dict[str, Any]]]:
+    raw: list[list[Path]] = []
+    meta: list[dict[str, Any]] = []
+    for a, b, m in ranges:
+        raw.append([Path(files[k]) for k in range(a, b + 1)])
+        meta.append(dict(m))
+    return raw, meta
 
 
 def _fuzzy_ranges_for_batch(
@@ -265,55 +361,99 @@ def _load_fuzzy_roll_cache(path: Path) -> dict[str, Any] | None:
     return data
 
 
+def _fuzzy_cfg_cache_fields(cfg: FuzzyMatchConfig) -> dict[str, Any]:
+    return {
+        "phash_max_dim": cfg.phash_max_dim,
+        "max_adjacent_hamming": cfg.max_adjacent_hamming,
+        "colorhash_max_hamming": cfg.colorhash_max_hamming,
+        "max_adjacent_gap_sec": cfg.max_adjacent_gap_sec,
+        "palette_enabled": cfg.palette_enabled,
+        "palette_max_distance": cfg.palette_max_distance,
+        "palette_max_color_count_delta": cfg.palette_max_color_count_delta,
+        "palette_min_grid_agreement": cfg.palette_min_grid_agreement,
+        "palette_grid": cfg.palette_grid,
+        "fast_path_enabled": cfg.fast_path_enabled,
+        "grid_exact_match_min": cfg.grid_exact_match_min,
+    }
+
+
+def _serialize_features_list(features: list[FuzzyFeatures | None]) -> tuple[
+    list[str | None],
+    list[str | None],
+    list[str | None],
+    list[float | None],
+]:
+    hashes: list[str | None] = []
+    colorhashes: list[str | None] = []
+    palettes: list[str | None] = []
+    timestamps: list[float | None] = []
+    for f in features:
+        if f is None:
+            hashes.append(None)
+            colorhashes.append(None)
+            palettes.append(None)
+            timestamps.append(None)
+            continue
+        hashes.append(str(f.phash) if f.phash is not None else None)
+        colorhashes.append(str(f.colorhash) if f.colorhash is not None else None)
+        palettes.append(f.palette.serialize() if f.palette is not None else None)
+        timestamps.append(f.capture_ts)
+    return hashes, colorhashes, palettes, timestamps
+
+
 def _save_fuzzy_roll_cache(
     path: Path,
     *,
     mount_root: Path,
     mount_udid: str | None,
-    phash_max_dim: int,
-    max_adjacent_hamming: int,
+    cfg: FuzzyMatchConfig,
     paths: list[Path],
-    hashes: list[imagehash.ImageHash | None],
+    features: list[FuzzyFeatures | None],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    serial_hashes: list[str | None] = []
-    for h in hashes:
-        if h is None:
-            serial_hashes.append(None)
-        else:
-            serial_hashes.append(str(h))
-    payload = {
-        # Bump when manifest rules change (e.g. DCIM-only walk, HEIF/JPEG dedupe).
-        "version": 2,
+    hashes, colorhashes, palettes, timestamps = _serialize_features_list(features)
+    payload: dict[str, Any] = {
+        "version": FUZZY_CACHE_VERSION,
         "mount_root": str(mount_root.resolve()),
         "mount_udid": mount_udid or "",
-        "phash_max_dim": phash_max_dim,
-        "max_adjacent_hamming": max_adjacent_hamming,
         "paths": [str(p.resolve()) for p in paths],
-        "hashes": serial_hashes,
+        "hashes": hashes,
+        "colorhashes": colorhashes,
+        "palette_sigs": palettes,
+        "capture_ts": timestamps,
     }
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    payload.update(_fuzzy_cfg_cache_fields(cfg))
+    path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
 
 
 def _cache_matches_mount(
     data: dict[str, Any],
     mount_root: Path,
     mount_udid: str | None,
-    phash_max_dim: int,
-    max_adjacent_hamming: int,
+    cfg: FuzzyMatchConfig,
 ) -> bool:
     try:
-        if int(data.get("version") or 0) != 2:
+        ver = int(data.get("version") or 0)
+        if ver not in (2, FUZZY_CACHE_VERSION):
             return False
-        return (
-            str(data.get("mount_root") or "") == str(mount_root.resolve())
-            and str(data.get("mount_udid") or "") == str(mount_udid or "")
-            and int(data.get("phash_max_dim") or -1) == phash_max_dim
-            and int(data.get("max_adjacent_hamming") or -1) == max_adjacent_hamming
-            and isinstance(data.get("paths"), list)
-            and isinstance(data.get("hashes"), list)
-            and len(data["paths"]) == len(data["hashes"])
-        )
+        if str(data.get("mount_root") or "") != str(mount_root.resolve()):
+            return False
+        if str(data.get("mount_udid") or "") != str(mount_udid or ""):
+            return False
+        if not isinstance(data.get("paths"), list) or not isinstance(data.get("hashes"), list):
+            return False
+        if len(data["paths"]) != len(data["hashes"]):
+            return False
+        if ver == FUZZY_CACHE_VERSION:
+            for key, val in _fuzzy_cfg_cache_fields(cfg).items():
+                if data.get(key) != val:
+                    return False
+        else:
+            if int(data.get("phash_max_dim") or -1) != cfg.phash_max_dim:
+                return False
+            if int(data.get("max_adjacent_hamming") or -1) != cfg.max_adjacent_hamming:
+                return False
+        return True
     except Exception:
         return False
 
@@ -331,6 +471,43 @@ def _deserialize_fuzzy_hashes(raw: list[Any]) -> list[imagehash.ImageHash | None
     return out
 
 
+def _deserialize_features_from_cache(
+    data: dict[str, Any],
+    cfg: FuzzyMatchConfig,
+) -> list[FuzzyFeatures | None]:
+    n = len(data.get("paths") or [])
+    hashes = _deserialize_fuzzy_hashes(list(data.get("hashes") or []))
+    raw_ch = list(data.get("colorhashes") or [None] * n)
+    raw_pl = list(data.get("palette_sigs") or [None] * n)
+    raw_ts = list(data.get("capture_ts") or [None] * n)
+    grid_side = cfg.grid_side
+    out: list[FuzzyFeatures | None] = []
+    for i in range(n):
+        ph = hashes[i] if i < len(hashes) else None
+        ch: imagehash.ImageHash | None = None
+        if i < len(raw_ch) and raw_ch[i]:
+            try:
+                ch = imagehash.hex_to_hash(str(raw_ch[i]))
+            except Exception:
+                ch = None
+        pal = None
+        if i < len(raw_pl) and raw_pl[i]:
+            from iphone_cleanup.fuzzy_palette import PaletteSignature
+
+            pal = PaletteSignature.deserialize(str(raw_pl[i]), grid_side=grid_side)
+        ts = None
+        if i < len(raw_ts) and raw_ts[i] is not None:
+            try:
+                ts = float(raw_ts[i])
+            except (TypeError, ValueError):
+                ts = None
+        if ph is None and ch is None and pal is None:
+            out.append(None)
+        else:
+            out.append(FuzzyFeatures(phash=ph, colorhash=ch, palette=pal, capture_ts=ts))
+    return out
+
+
 def run_fuzzy_roll_scan_batch(
     mount_root: Path,
     *,
@@ -340,15 +517,17 @@ def run_fuzzy_roll_scan_batch(
     batch_size: int,
     phash_max_dim: int,
     max_adjacent_hamming: int,
+    fuzzy_match_config: FuzzyMatchConfig | None = None,
+    fuzzy_roll_sort_exif: bool = False,
     progress_callback: Any | None = None,
     cancel_event: threading.Event | None = None,
 ) -> tuple[list[dict[str, Any]], int, int]:
     """
-    One interactive fuzzy batch: ensure sorted path manifest + pHash cache, hash only the next slice,
-    return burst groups whose chain starts in this slice. Persists partial hashes for resume.
+    One interactive fuzzy batch: sorted manifest + feature cache, analyze adjacent multi-signal chains.
 
     Returns (groups, next_start_index, total_images).
     """
+    cfg = fuzzy_match_config or _default_fuzzy_match_config(phash_max_dim, max_adjacent_hamming)
     root_r = mount_root.resolve()
     cache_path = fuzzy_roll_cache_path(scan_artifacts_dir, mount_udid, root_r)
 
@@ -357,15 +536,17 @@ def run_fuzzy_roll_scan_batch(
             raise ScanCancelled([])
 
     paths: list[Path]
-    hashes: list[imagehash.ImageHash | None]
+    features: list[FuzzyFeatures | None]
 
     loaded = _load_fuzzy_roll_cache(cache_path)
-    if loaded and _cache_matches_mount(loaded, root_r, mount_udid, phash_max_dim, max_adjacent_hamming):
+    if loaded and _cache_matches_mount(loaded, root_r, mount_udid, cfg):
         paths = [Path(p) for p in loaded["paths"]]
-        hashes = _deserialize_fuzzy_hashes(list(loaded["hashes"]))
+        features = _deserialize_features_from_cache(loaded, cfg)
         if progress_callback:
             progress_callback(
-                0, max(len(paths), 1), f"[fuzzy-roll-batch] Loaded fuzzy pHash cache — {len(paths)} image(s) in roll order."
+                0,
+                max(len(paths), 1),
+                f"[fuzzy-roll-batch] Loaded fuzzy feature cache — {len(paths)} image(s) in roll order.",
             )
     else:
         def walk_prog(n_img: int, rel: str) -> None:
@@ -377,24 +558,31 @@ def run_fuzzy_roll_scan_batch(
         paths = _walk_images(
             mount_root,
             cancel_event,
+            walk_progress_every=250,
             walk_progress=walk_prog if progress_callback else None,
         )
-        paths.sort(key=lambda p: (_exif_capture_ts(p), str(p)))
-        hashes = [None] * len(paths)
+        sort_label = "EXIF capture time" if fuzzy_roll_sort_exif else "file date + path (fast)"
         if progress_callback and paths:
             progress_callback(
                 0,
                 max(len(paths), 1),
-                f"[fuzzy-roll-batch] Roll order: {len(paths)} image(s); building fuzzy index (one-time walk + sort)…",
+                f"[fuzzy-roll-batch] Sorting {len(paths)} image(s) by {sort_label} (one-time for this mount)…",
+            )
+        paths.sort(key=lambda p: _roll_sort_key(p, use_exif=fuzzy_roll_sort_exif))
+        features = [None] * len(paths)
+        if progress_callback and paths:
+            progress_callback(
+                0,
+                max(len(paths), 1),
+                f"[fuzzy-roll-batch] Indexed {len(paths)} image(s); features filled batch-by-batch.",
             )
         _save_fuzzy_roll_cache(
             cache_path,
             mount_root=root_r,
             mount_udid=mount_udid,
-            phash_max_dim=phash_max_dim,
-            max_adjacent_hamming=max_adjacent_hamming,
+            cfg=cfg,
             paths=paths,
-            hashes=hashes,
+            features=features,
         )
 
     try:
@@ -406,60 +594,69 @@ def run_fuzzy_roll_scan_batch(
         if batch_start >= n:
             return ([], n, n)
 
-        win_end = min(n, batch_start + max(1, batch_size))
+        if batch_size <= 0:
+            win_end = n
+        else:
+            win_end = min(n, batch_start + max(1, batch_size))
         hash_lo = max(0, batch_start - 1)
         hash_hi = win_end
 
-        pending = sum(1 for i in range(hash_lo, hash_hi) if hashes[i] is None)
+        pending = sum(1 for i in range(hash_lo, hash_hi) if features[i] is None)
         done = 0
         if pending == 0 and progress_callback:
             progress_callback(
                 1,
                 1,
-                f"[fuzzy-roll-batch] Slice [{batch_start}, {win_end}) — all pHashes in slice already cached; analyzing adjacent bursts…",
+                f"[fuzzy-roll-batch] Slice [{batch_start}, {win_end}) — features cached; analyzing adjacent sets…",
             )
         for i in range(hash_lo, hash_hi):
             _check_cancel()
-            if hashes[i] is not None:
+            if features[i] is not None:
                 continue
             p = paths[i]
-            hashes[i] = _phash(p, phash_max_dim, cancel_check=_check_cancel)
+            ts = float(_exif_capture_ts(p))
+            features[i] = extract_fuzzy_features_from_path(
+                p,
+                max_dim=cfg.phash_max_dim,
+                grid_side=cfg.grid_side,
+                capture_ts=ts,
+                cancel_check=_check_cancel,
+            )
             done += 1
             if progress_callback and pending > 0:
                 rel = _rel_under_mount(root_r, p)
                 progress_callback(
                     done,
                     max(pending, 1),
-                    f"[fuzzy-roll-batch] Slice [{batch_start}, {win_end}) pHash {done}/{pending} in this slice — {rel}",
+                    f"[fuzzy-roll-batch] Slice [{batch_start}, {win_end}) features {done}/{pending} — {rel}",
                 )
 
         _save_fuzzy_roll_cache(
             cache_path,
             mount_root=root_r,
             mount_udid=mount_udid,
-            phash_max_dim=phash_max_dim,
-            max_adjacent_hamming=max_adjacent_hamming,
+            cfg=cfg,
             paths=paths,
-            hashes=hashes,
+            features=features,
         )
 
-        all_ranges = _fuzzy_burst_index_ranges(n, hashes, max_adjacent_hamming, _check_cancel)
-        slice_ranges = _fuzzy_ranges_for_batch(all_ranges, batch_start, win_end)
-        raw = _ranges_to_raw_groups(paths, slice_ranges)
-        groups = finalize_groups(raw, scan_kind="fuzzy")
+        slice_ranges = _fuzzy_burst_starts_in_window(
+            n, features, cfg, _check_cancel, batch_start, win_end
+        )
+        raw, meta = _ranges_to_raw_groups_with_meta(paths, slice_ranges)
+        groups = finalize_groups(raw, scan_kind="fuzzy", group_extras=meta)
         next_start = win_end
         return (groups, next_start, n)
     except ScanCancelled:
-        if paths and hashes and len(paths) == len(hashes):
+        if paths and features and len(paths) == len(features):
             try:
                 _save_fuzzy_roll_cache(
                     cache_path,
                     mount_root=root_r,
                     mount_udid=mount_udid,
-                    phash_max_dim=phash_max_dim,
-                    max_adjacent_hamming=max_adjacent_hamming,
+                    cfg=cfg,
                     paths=paths,
-                    hashes=hashes,
+                    features=features,
                 )
             except OSError:
                 pass
@@ -470,9 +667,12 @@ def scan_duplicates(
     mount_root: Path,
     phash_threshold: int,
     phash_max_dim: int = 256,
+    *,
+    exact_max_hash_cluster: int = 150,
     progress_callback: Any | None = None,
     cancel_event: threading.Event | None = None,
-) -> list[dict[str, Any]]:
+    walk_progress_every: int = 250,
+) -> tuple[list[dict[str, Any]], int]:
     root_r = mount_root.resolve()
 
     def walk_prog(n_img: int, rel: str) -> None:
@@ -482,6 +682,7 @@ def scan_duplicates(
     files = _walk_images(
         mount_root,
         cancel_event,
+        walk_progress_every=walk_progress_every,
         walk_progress=walk_prog if progress_callback else None,
     )
     if progress_callback and files:
@@ -529,17 +730,50 @@ def scan_duplicates(
         idxs = [i for i, h in enumerate(hashes) if h is not None]
         pairs: list[tuple[int, int]] = []
         pair_ops = 0
-        for ii in range(len(idxs)):
-            for jj in range(ii + 1, len(idxs)):
-                pair_ops += 1
-                if pair_ops % 128 == 0:
-                    _check_cancel()
-                i, j = idxs[ii], idxs[jj]
-                hi, hj = hashes[i], hashes[j]
-                if hi is None or hj is None:
-                    continue
-                if hi - hj <= phash_threshold:
-                    pairs.append((i, j))
+
+        def _add_pair(i: int, j: int) -> None:
+            nonlocal pair_ops
+            pair_ops += 1
+            if pair_ops % 128 == 0:
+                _check_cancel()
+            hi, hj = hashes[i], hashes[j]
+            if hi is None or hj is None:
+                return
+            if hi - hj <= phash_threshold:
+                pairs.append((i, j))
+
+        compare_sets: list[list[int]] = [idxs] if len(idxs) <= 120 else []
+        if not compare_sets:
+            by_prefix: dict[str, list[int]] = defaultdict(list)
+            for i in idxs:
+                h = hashes[i]
+                if h is not None:
+                    by_prefix[str(h)[:8]].append(i)
+            compare_sets = list(by_prefix.values())
+        for sub in compare_sets:
+            if exact_max_hash_cluster > 0 and len(sub) > exact_max_hash_cluster:
+                if progress_callback:
+                    progress_callback(
+                        processed,
+                        len(files),
+                        f"[exact-dup] Comparing {len(sub)}-image hash cluster in chunks "
+                        f"(>{exact_max_hash_cluster} files; full library, no skip)…",
+                    )
+                chunk = exact_max_hash_cluster
+                for start in range(0, len(sub), chunk):
+                    part = sub[start : start + chunk]
+                    for ii in range(len(part)):
+                        for jj in range(ii + 1, len(part)):
+                            _add_pair(part[ii], part[jj])
+                    if start + chunk < len(sub):
+                        bridge = sub[start + chunk - 1 : start + chunk + 1]
+                        for ii in range(len(bridge)):
+                            for jj in range(ii + 1, len(bridge)):
+                                _add_pair(bridge[ii], bridge[jj])
+                continue
+            for ii in range(len(sub)):
+                for jj in range(ii + 1, len(sub)):
+                    _add_pair(sub[ii], sub[jj])
         _check_cancel()
         roots = _union_find(len(bucket), pairs)
         clusters: dict[int, list[int]] = defaultdict(list)
@@ -551,7 +785,7 @@ def scan_duplicates(
             paths = [str(bucket[i].resolve()) for i in members]
             raw_groups.append([Path(x) for x in paths])
 
-    return finalize_duplicate_groups(raw_groups)
+    return finalize_duplicate_groups(raw_groups), len(files)
 
 
 def scan_fuzzy_roll_bursts(
@@ -559,16 +793,16 @@ def scan_fuzzy_roll_bursts(
     *,
     phash_max_dim: int,
     max_adjacent_hamming: int,
+    fuzzy_match_config: FuzzyMatchConfig | None = None,
     progress_callback: Any | None = None,
     cancel_event: threading.Event | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Group consecutive photos in capture-time roll order when adjacent pHash distance is low
-    (visually similar bursts, e.g. many shots of the same subject).
+    Group consecutive roll-order photos via multi-signal adjacent linking (pHash, colorhash, palette).
 
-    Hashes the entire library in one pass (used by tests and callers that want a full scan).
     The web UI uses :func:`run_fuzzy_roll_scan_batch` for interactive slices + disk cache.
     """
+    cfg = fuzzy_match_config or _default_fuzzy_match_config(phash_max_dim, max_adjacent_hamming)
     root_r = mount_root.resolve()
 
     def walk_prog(n_img: int, rel: str) -> None:
@@ -583,29 +817,69 @@ def scan_fuzzy_roll_bursts(
     files.sort(key=lambda p: (_exif_capture_ts(p), str(p)))
     n = len(files)
     if progress_callback and files:
-        progress_callback(0, max(n, 1), f"[fuzzy-roll-full] Roll order: {n} image(s); hashing for fuzzy bursts…")
+        progress_callback(0, max(n, 1), f"[fuzzy-roll-full] Roll order: {n} image(s); extracting fuzzy features…")
 
     def _check_cancel() -> None:
         if cancel_event and cancel_event.is_set():
             raise ScanCancelled([])
 
-    hashes: list[imagehash.ImageHash | None] = []
+    feat_list: list[FuzzyFeatures | None] = []
     for i, p in enumerate(files):
         _check_cancel()
-        hashes.append(_phash(p, phash_max_dim, cancel_check=_check_cancel))
+        ts = _exif_capture_ts(p)
+        feat_list.append(
+            extract_fuzzy_features_from_path(
+                p,
+                max_dim=cfg.phash_max_dim,
+                grid_side=cfg.grid_side,
+                capture_ts=ts if ts else None,
+                cancel_check=_check_cancel,
+            )
+        )
         if progress_callback:
             rel = _rel_under_mount(root_r, p)
-            progress_callback(i + 1, max(n, 1), f"[fuzzy-roll-full] Fuzzy pre-hash {i + 1}/{n} — {rel}")
+            progress_callback(i + 1, max(n, 1), f"[fuzzy-roll-full] Fuzzy features {i + 1}/{n} — {rel}")
 
-    ranges = _fuzzy_burst_index_ranges(n, hashes, max_adjacent_hamming, _check_cancel)
-    completed_bursts = _ranges_to_raw_groups(files, ranges)
-    return finalize_groups(completed_bursts, scan_kind="fuzzy")
+    ranges = _fuzzy_burst_index_ranges(n, feat_list, cfg, _check_cancel)
+    raw, meta = _ranges_to_raw_groups_with_meta(files, ranges)
+    return finalize_groups(raw, scan_kind="fuzzy", group_extras=meta)
 
 
-def write_artifact(path: Path, groups: list[dict[str, Any]], *, scan_kind: str | None = None) -> None:
+def fuzzy_palette_scipy_status() -> str:
+    from iphone_cleanup.fuzzy_palette import scipy_available
+
+    return "yes" if scipy_available() else "fallback_intersection"
+
+
+def fuzzy_match_config_from_settings(settings: Any) -> FuzzyMatchConfig:
+    """Build fuzzy link config from app Settings."""
+    return FuzzyMatchConfig(
+        phash_max_dim=int(settings.fuzzy_phash_max_dim),
+        max_adjacent_hamming=int(settings.fuzzy_phash_max_hamming),
+        colorhash_max_hamming=int(settings.fuzzy_colorhash_max_hamming),
+        max_adjacent_gap_sec=float(settings.fuzzy_max_adjacent_gap_sec),
+        palette_enabled=bool(settings.fuzzy_palette_enabled),
+        palette_max_distance=float(settings.fuzzy_palette_max_distance),
+        palette_max_color_count_delta=int(settings.fuzzy_palette_max_color_count_delta),
+        palette_min_grid_agreement=float(settings.fuzzy_palette_min_grid_agreement),
+        palette_grid=int(settings.fuzzy_palette_grid),
+        fast_path_enabled=bool(settings.fuzzy_fast_path_enabled),
+        grid_exact_match_min=int(settings.fuzzy_grid_exact_match_min),
+    )
+
+
+def write_artifact(
+    path: Path,
+    groups: list[dict[str, Any]],
+    *,
+    scan_kind: str | None = None,
+    group_keep: dict[str, list[str]] | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     sk = scan_kind or (groups[0].get("scan_kind") if groups else None) or "exact"
-    payload = {"scan_kind": sk, "groups": groups}
+    payload: dict[str, Any] = {"scan_kind": sk, "groups": groups}
+    if group_keep is not None:
+        payload["group_keep"] = group_keep
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 

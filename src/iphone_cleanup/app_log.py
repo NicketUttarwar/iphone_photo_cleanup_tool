@@ -29,3 +29,10 @@ def log_event(message: str, **fields: Any) -> None:
         _LOG.info(json.dumps(payload, default=str))
     except Exception:
         _LOG.info(message)
+
+
+def log_activity(message: str) -> None:
+    """Mirror UI activity lines into the same rotating app.log file."""
+    if not message or not _LOG.handlers:
+        return
+    _LOG.info(f"[activity] {message}")

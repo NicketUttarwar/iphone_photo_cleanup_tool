@@ -84,6 +84,12 @@ if [[ "$SKIP_HOST_CHECK" -eq 0 ]]; then
 fi
 
 APP_PYTHON="$VENV_DIR/bin/python"
+RUN_SESSION_ID="$(date +%Y%m%d_%H%M%S)_$$"
+export IPHONE_CLEANUP_RUN_ID="$RUN_SESSION_ID"
+mkdir -p "$REPO_ROOT/data"
+RUN_SESSION_FILE="$REPO_ROOT/data/.run_session.json"
+printf '%s\n' "{\"run_id\":\"$RUN_SESSION_ID\",\"shell_pid\":$$,\"started_at\":$(date +%s)}" >"$RUN_SESSION_FILE"
+
 ARGS=(
   -m iphone_cleanup
   --repo-root "$REPO_ROOT"
@@ -115,6 +121,7 @@ forward_signal() {
 
 on_exit() {
   trap - EXIT INT TERM HUP
+  rm -f "$REPO_ROOT/data/.run_session.json" "$REPO_ROOT/data/runtime_session.json" 2>/dev/null || true
   if [[ "$APP_PID" -ne 0 ]] && kill -0 "$APP_PID" 2>/dev/null; then
     # Child still alive at shell exit (e.g. uncaught error in the script);
     # ask it to terminate, then escalate if it does not stop in time.

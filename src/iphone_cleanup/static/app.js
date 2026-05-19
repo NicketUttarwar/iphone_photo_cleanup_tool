@@ -1,9 +1,176 @@
 /* global fetch, EventSource, document, window */
+const STATUS_POLL_MS =
+  typeof window.__APP_POLL_MS__ === "number" && window.__APP_POLL_MS__ > 0
+    ? window.__APP_POLL_MS__
+    : 5000;
+const STATUS_POLL_BUSY_MS = Math.max(1000, Math.min(STATUS_POLL_MS, 2000));
 let lastPhase = "";
+let lastScanKind = "";
+let reviewThumbEdge = 1024;
+let groupsPageSize = 30;
+let previewPageSize = 24;
+let imagesPerGroupPage = 12;
+let lastLoadedGroupCounts = { exact: -1, fuzzy: -1 };
+let autoReviewEnabled = true;
+
+const REVIEW_SIZE_FILTERS = [
+  { id: "all", label: "All sizes", short: "All", deleteScope: "all duplicate sets" },
+  { id: "2", label: "Exactly 2 photos", short: "2 photos", deleteScope: "2-photo sets only" },
+  { id: "3", label: "Exactly 3 photos", short: "3 photos", deleteScope: "3-photo sets only" },
+  { id: "4", label: "Exactly 4 photos", short: "4 photos", deleteScope: "4-photo sets only" },
+  { id: "5plus", label: "5 or more photos", short: "5+ photos", deleteScope: "5+ photo sets only" },
+];
+
+const reviewPagerState = {
+  exact: { page: 0, total: 0, loading: false, dialogOpen: false, sizeFilter: "all", sizeCounts: null },
+  fuzzy: { page: 0, total: 0, loading: false, dialogOpen: false, sizeFilter: "all", sizeCounts: null },
+};
+
+const docPreviewPager = { page: 0, total: 0, scope: "older_than_90d", vf: false };
+const deletePreviewPager = { exact: { page: 0, total: 0 }, fuzzy: { page: 0, total: 0 } };
+
+function formatLibraryCount(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v) || v < 0) return "—";
+  if (v >= 1000000) return `${(v / 1000000).toFixed(1).replace(/\.0$/, "")}M`;
+  if (v >= 10000) return `${Math.round(v / 1000)}k`;
+  if (v >= 1000) return `${(v / 1000).toFixed(1).replace(/\.0$/, "")}k`;
+  return String(Math.round(v));
+}
+
+function libraryIndexLabel(s) {
+  const n = s.library_indexed_count;
+  if (n == null || n <= 0) return "";
+  return ` (${formatLibraryCount(n)} photos indexed on this mount)`;
+}
 let mountPath = "";
+let thumbnailMountRoot = "";
 let lastDocumentBatches = [];
 let docPreviewDebounceTimer = null;
 let lastDocPreviewKey = "";
+let statusPollTimer = null;
+let statusPollInFlight = false;
+let statusPollFailStreak = 0;
+let uiBootstrapDone = false;
+const STATUS_FETCH_TIMEOUT_MS = 12000;
+let lastSnapshot = null;
+let activeExactScanSessionId = "";
+let activeFuzzyScanSessionId = "";
+let scanSessionsLoadingExact = false;
+let scanSessionsLoadingFuzzy = false;
+
+const SCAN_WORKFLOWS = {
+  exact: {
+    kind: "exact",
+    sessionListId: "exactScanSessionList",
+    emptyId: "exactScanWorkspaceEmpty",
+    loadingId: "exactScanWorkspaceLoading",
+    teaserId: "exactDupReviewTeaser",
+    hintId: "exactScanRunHint",
+    groupsId: "exactGroups",
+    dlgId: "dlgExactDupReview",
+    btnOpenId: "btnExactDupReviewOpen",
+    btnCloseId: "btnExactDupReviewClose",
+    btnCloseFooterId: "btnExactDupReviewCloseFooter",
+    btnDeleteId: "btnDeleteExact",
+    btnScanId: "btnScan",
+    btnCancelId: "btnScanCancelExact",
+    dlgDeleteId: "dlgDeleteExact",
+    deleteSummaryId: "deleteExactPreviewSummary",
+    deleteStripId: "deleteExactPreviewStrip",
+    confirmInputId: "confirmInputExact",
+    btnConfirmDeleteId: "btnConfirmDeleteExact",
+    btnCancelDeleteId: "btnCancelDeleteExact",
+    panelId: "exactDupPanel",
+    activeSnapshotKey: "active_exact_scan_session_id",
+    groupCountSnapshotKey: "exact_group_count",
+    pagerPrevId: "btnExactReviewPrev",
+    pagerNextId: "btnExactReviewNext",
+    pagerLabelId: "exactReviewPageLabel",
+    titleId: "exactDupPopoutHeading",
+    sizeSliderId: "exactReviewSizeSlider",
+    sizeValueId: "exactReviewSizeValue",
+    sizeHintId: "exactReviewSizeHint",
+  },
+  fuzzy: {
+    kind: "fuzzy",
+    sessionListId: "fuzzyScanSessionList",
+    emptyId: "fuzzyScanWorkspaceEmpty",
+    loadingId: "fuzzyScanWorkspaceLoading",
+    teaserId: "fuzzyDupReviewTeaser",
+    hintId: "fuzzyScanRunHint",
+    groupsId: "fuzzyGroups",
+    dlgId: "dlgFuzzyDupReview",
+    btnOpenId: "btnFuzzyDupReviewOpen",
+    btnCloseId: "btnFuzzyDupReviewClose",
+    btnCloseFooterId: "btnFuzzyDupReviewCloseFooter",
+    btnDeleteId: "btnDeleteFuzzy",
+    btnScanId: "btnScanFuzzy",
+    btnCancelId: "btnScanCancelFuzzy",
+    dlgDeleteId: "dlgDeleteFuzzy",
+    deleteSummaryId: "deleteFuzzyPreviewSummary",
+    deleteStripId: "deleteFuzzyPreviewStrip",
+    confirmInputId: "confirmInputFuzzy",
+    btnConfirmDeleteId: "btnConfirmDeleteFuzzy",
+    btnCancelDeleteId: "btnCancelDeleteFuzzy",
+    panelId: "fuzzyRollPanel",
+    activeSnapshotKey: "active_fuzzy_scan_session_id",
+    groupCountSnapshotKey: "fuzzy_group_count",
+    pagerPrevId: "btnFuzzyReviewPrev",
+    pagerNextId: "btnFuzzyReviewNext",
+    pagerLabelId: "fuzzyReviewPageLabel",
+    titleId: "fuzzyDupPopoutHeading",
+    sizeSliderId: "fuzzyReviewSizeSlider",
+    sizeValueId: "fuzzyReviewSizeValue",
+    sizeHintId: "fuzzyReviewSizeHint",
+  },
+};
+
+function reviewPagerKey(kind) {
+  return kind === "fuzzy" ? "fuzzy" : "exact";
+}
+
+function sizeFilterFromSliderIndex(idx) {
+  const i = Number(idx);
+  return REVIEW_SIZE_FILTERS[Number.isFinite(i) ? Math.max(0, Math.min(4, i)) : 0]?.id || "all";
+}
+
+function sliderIndexFromSizeFilter(filterId) {
+  const i = REVIEW_SIZE_FILTERS.findIndex((x) => x.id === filterId);
+  return i >= 0 ? i : 0;
+}
+
+function sizeFilterMeta(filterId) {
+  return REVIEW_SIZE_FILTERS.find((x) => x.id === filterId) || REVIEW_SIZE_FILTERS[0];
+}
+
+function sizeFilterQueryParam(sizeFilter) {
+  return `size_filter=${encodeURIComponent(sizeFilter || "all")}`;
+}
+
+function reviewTotalPages(total) {
+  if (!total || total <= 0) return 0;
+  return Math.ceil(total / groupsPageSize);
+}
+
+function clampReviewPage(page, total) {
+  const tp = reviewTotalPages(total);
+  if (tp <= 0) return 0;
+  return Math.max(0, Math.min(page, tp - 1));
+}
+
+function workflowCfg(kind) {
+  return SCAN_WORKFLOWS[kind === "fuzzy" ? "fuzzy" : "exact"];
+}
+
+function activeSessionIdFor(kind) {
+  return kind === "fuzzy" ? activeFuzzyScanSessionId : activeExactScanSessionId;
+}
+
+function setActiveSessionIdFor(kind, id) {
+  if (kind === "fuzzy") activeFuzzyScanSessionId = id || "";
+  else activeExactScanSessionId = id || "";
+}
 
 function formatHumanBytes(bytes) {
   const n = Number(bytes);
@@ -34,97 +201,185 @@ function fmtEpochSeconds(ts) {
   }
 }
 
-/** Snapshot of session fields so the operator always sees what the server thinks is true. */
-function renderActivityDiagnostics(s) {
-  const el = document.getElementById("activityDiagnostics");
-  if (!el) return;
-  const fz =
-    typeof s.fuzzy_roll_total === "number"
-      ? `${s.fuzzy_roll_next_start ?? 0}/${s.fuzzy_roll_total}`
-      : "n/a";
-  const lines = [
-    `BROWSER_NOW_UTC ${new Date().toISOString()}`,
-    `PHASE ${s.phase || "—"} | scan_cancel_pending=${Boolean(s.scan_cancel_pending)} | duplicate_groups=${s.group_count ?? "—"}`,
-    `MOUNT mount_path=${s.mount_path || "—"}`,
-    `MOUNT mount_udid=${s.mount_udid || "—"}`,
-    `FUZZY_ROLL next/total=${fz} | exhausted=${Boolean(s.fuzzy_roll_exhausted)} | batch_size=${s.fuzzy_roll_batch_size ?? "—"}`,
-    `SCAN_ARTIFACT ${s.scan_artifact_path || "—"}`,
-  ];
-  if (s.last_error) lines.push(`LAST_ERROR ${s.last_error}`);
-  const jobs = s.jobs || [];
-  if (jobs.length) {
-    lines.push(`JOBS (${jobs.length})`);
-    for (const j of jobs) {
-      const run = j.running ? "RUNNING" : "idle";
-      lines.push(
-        `  - ${run} id=${j.job_id} kind=${j.kind} | ${j.label || ""} | msg=${j.message || ""} | ` +
-          `prog=${j.progress_current ?? "—"}/${j.progress_total ?? "—"} | started=${fmtEpochSeconds(j.started_at)} | finished=${fmtEpochSeconds(j.finished_at)}`,
-      );
-    }
-  } else {
-    lines.push("JOBS none in snapshot");
+function isSessionBusy(s) {
+  const phase = s.phase || "";
+  if (phase === "mounting" || phase === "scanning" || phase === "deleting" || phase === "unmounting") {
+    return true;
   }
-  el.textContent = lines.join("\n");
+  return (s.jobs || []).some((j) => j.running);
 }
 
-/** Renders per-job progress bars and the rolling activity log from `/api/status` / SSE. */
-function renderActivityHub(s) {
-  const jobsEl = document.getElementById("activityJobs");
-  const logEl = document.getElementById("activityLog");
-  if (!jobsEl || !logEl) return;
-  const jobs = (s.jobs || []).filter((j) => j.running);
-  jobsEl.innerHTML = "";
-  if (jobs.length === 0) {
-    const idle = document.createElement("p");
-    idle.className = "muted activity-idle-msg";
-    idle.style.margin = "0";
-    idle.style.fontSize = "0.88rem";
-    idle.textContent =
-      "No background job is running right now. When you mount, scan, delete, or move documents, a labeled job " +
-      "appears here with a progress bar and a detailed status line. The log below records every step with timestamps.";
-    jobsEl.appendChild(idle);
+function mergeSnapshotPatch(patch) {
+  const base = lastSnapshot ? { ...lastSnapshot } : {};
+  const next = { ...base, ...patch };
+  if (patch.jobs && base.jobs) {
+    next.jobs = patch.jobs;
+  }
+  applySnapshot(next);
+  return next;
+}
+
+function optimisticBusyPhase(phase, scanKind) {
+  const patch = { phase };
+  if (scanKind) patch.scan_running_kind = scanKind;
+  if (phase === "scanning") {
+    patch.jobs = [
+      {
+        running: true,
+        kind: "scan",
+        label:
+          scanKind === "fuzzy"
+            ? "Fuzzy roll batch (bursts & same-scene sets)…"
+            : "Scanning library for duplicates…",
+        message: "Starting…",
+      },
+    ];
+  } else if (phase === "mounting") {
+    patch.jobs = [{ running: true, kind: "mount", label: "Mounting iPhone media…", message: "Starting…" }];
+  } else if (phase === "deleting") {
+    patch.jobs = [{ running: true, kind: "delete", label: "Deleting from phone…", message: "Starting…" }];
+  } else if (phase === "unmounting") {
+    patch.jobs = [{ running: true, kind: "unmount", label: "Unmounting…", message: "Starting…" }];
+  }
+  mergeSnapshotPatch(patch);
+}
+
+function phaseHeadline(s) {
+  const phase = s.phase || "idle";
+  const label = s.phase_label || phase;
+  const rk = s.scan_running_kind || lastScanKind || "";
+  if (phase === "scanning" && rk === "fuzzy") {
+    return `${label} (fuzzy roll batch)`;
+  }
+  if (phase === "scanning" && rk === "exact") {
+    return `${label} (exact duplicate scan)`;
+  }
+  return label;
+}
+
+function buildLiveStatusSummary(s) {
+  const phaseLine = phaseHeadline(s);
+  const running = (s.jobs || []).filter((j) => j.running);
+  if (running.length) {
+    const j = running[0];
+    const label = j.label || j.kind || "Working";
+    const msg = j.message || "…";
+    return `${phaseLine} — ${label}: ${msg}`;
+  }
+  if (!s.run_session_active && s.run_session_active !== undefined) {
+    return "Session ended — restart with scripts/run.sh";
+  }
+  return phaseLine;
+}
+
+/** Lines shown in the main activity log (phase + jobs + server log). */
+function buildActivityLogLines(s) {
+  const out = [];
+  const phase = s.phase || "idle";
+  out.push(`════════ CURRENT PHASE: ${String(phase).toUpperCase()} ════════`);
+  out.push(phaseHeadline(s));
+  const running = (s.jobs || []).filter((j) => j.running);
+  for (const j of running) {
+    const label = j.label || j.kind || "job";
+    const msg = j.message || "…";
+    let line = `▶ ${label}: ${msg}`;
+    const tc = j.progress_total;
+    const cur = j.progress_current;
+    if (typeof tc === "number" && tc > 0 && typeof cur === "number") {
+      const pct = Math.min(100, Math.max(0, (100 * cur) / tc));
+      line += ` (${cur}/${tc}, ${pct.toFixed(1)}%)`;
+    }
+    out.push(line);
+  }
+  if (s.last_error) {
+    out.push(`⚠ ${s.last_error}`);
+  }
+  out.push("──────── session log (newest at bottom) ────────");
+  const log = s.activity_log || [];
+  if (log.length) {
+    out.push(...log);
   } else {
-    for (const j of jobs) {
-      const wrap = document.createElement("div");
-      wrap.className = "activity-job";
-      const title = document.createElement("div");
-      title.className = "activity-job-label";
-      title.textContent = `${j.label || j.kind || "Working…"} (${j.kind || "job"})`;
-      const barHost = document.createElement("div");
-      barHost.className = "progress-host";
-      const inner = document.createElement("div");
-      inner.className = "progress-bar-inner";
-      const tc = j.progress_total;
-      const cur = j.progress_current;
+    out.push(
+      "(no log lines yet — connect USB, mount, scan, delete, and document steps append here with timestamps)",
+    );
+  }
+  return out;
+}
+
+function statusPollIntervalMs(s) {
+  if (s && isSessionBusy(s)) return STATUS_POLL_BUSY_MS;
+  return STATUS_POLL_MS;
+}
+
+function markRefreshed(s) {
+  const label = document.getElementById("lastRefreshLabel");
+  if (label) {
+    const t = new Date();
+    const hh = String(t.getHours()).padStart(2, "0");
+    const mm = String(t.getMinutes()).padStart(2, "0");
+    const ss = String(t.getSeconds()).padStart(2, "0");
+    const everySec = Math.round(statusPollIntervalMs(s) / 1000);
+    label.textContent = `Refreshed ${hh}:${mm}:${ss} · every ${everySec}s`;
+  }
+  const spinner = document.getElementById("refreshSpinner");
+  if (spinner) spinner.classList.add("pulse");
+  window.setTimeout(() => {
+    spinner?.classList.remove("pulse");
+  }, 450);
+}
+
+function updateRefreshSpinner(s) {
+  const spinner = document.getElementById("refreshSpinner");
+  if (!spinner) return;
+  const busy = isSessionBusy(s);
+  spinner.classList.toggle("spinning", busy);
+  spinner.classList.toggle("hidden", !busy);
+}
+
+/** Single status line, compact progress bar, and unified activity log. */
+function renderUnifiedActivityHub(s) {
+  const summaryEl = document.getElementById("liveStatusSummary");
+  const logEl = document.getElementById("activityLog");
+  const progressWrap = document.getElementById("activityProgressWrap");
+  const progressInner = document.getElementById("activityProgressInner");
+  if (!summaryEl || !logEl) return;
+
+  summaryEl.textContent = buildLiveStatusSummary(s);
+
+  const running = (s.jobs || []).filter((j) => j.running);
+  const job = running[0];
+  if (progressWrap && progressInner) {
+    if (job) {
+      progressWrap.classList.remove("hidden");
+      progressWrap.setAttribute("aria-hidden", "false");
+      const tc = job.progress_total;
+      const cur = job.progress_current;
+      progressInner.classList.remove("indeterminate");
       if (typeof tc === "number" && tc > 0 && typeof cur === "number") {
         const pct = Math.min(100, Math.max(0, (100 * cur) / tc));
-        inner.style.width = `${pct}%`;
+        progressInner.style.width = `${pct}%`;
       } else {
-        inner.classList.add("indeterminate");
+        progressInner.style.width = "";
+        progressInner.classList.add("indeterminate");
       }
-      barHost.appendChild(inner);
-      const row = document.createElement("div");
-      row.className = "activity-job-msg";
-      row.textContent = j.message || "…";
-      const det = document.createElement("div");
-      det.className = "activity-job-details";
-      const pctStr =
-        typeof tc === "number" && tc > 0 && typeof cur === "number"
-          ? `${Math.min(100, Math.max(0, (100 * cur) / tc)).toFixed(1)}%`
-          : "n/a (no numeric progress yet)";
-      det.textContent = `job_id=${j.job_id || "—"} | kind=${j.kind || "—"} | started_utc=${fmtEpochSeconds(j.started_at)} | progress_count=${cur ?? "—"}/${tc ?? "—"} (${pctStr})`;
-      wrap.appendChild(title);
-      wrap.appendChild(barHost);
-      wrap.appendChild(row);
-      wrap.appendChild(det);
-      jobsEl.appendChild(wrap);
+    } else {
+      progressWrap.classList.add("hidden");
+      progressWrap.setAttribute("aria-hidden", "true");
+      progressInner.style.width = "";
+      progressInner.classList.remove("indeterminate");
     }
   }
-  const lines = s.activity_log || [];
-  logEl.textContent = lines.length
-    ? lines.join("\n")
-    : "No log lines yet — they appear here as the server reports each step (mount, scan, delete, documents).";
+
+  logEl.textContent = buildActivityLogLines(s).join("\n");
   logEl.scrollTop = logEl.scrollHeight;
+  updateRefreshSpinner(s);
+}
+
+function renderActivityHubMinimal(message) {
+  const summaryEl = document.getElementById("liveStatusSummary");
+  const logEl = document.getElementById("activityLog");
+  if (summaryEl) summaryEl.textContent = message;
+  if (logEl) logEl.textContent = message;
 }
 
 function clearThumbStrip(el) {
@@ -160,12 +415,47 @@ function fillHoldingThumbStrip(el, samples) {
   }
 }
 
+function docThumbPagerElements(ui = "panel") {
+  if (ui === "dlg") {
+    return {
+      pager: "docDlgPreviewPager",
+      label: "docDlgPreviewPagerLabel",
+      prev: "btnDocDlgPreviewPrev",
+      next: "btnDocDlgPreviewNext",
+    };
+  }
+  return {
+    pager: "docPreviewPager",
+    label: "docPreviewPagerLabel",
+    prev: "btnDocPreviewPrev",
+    next: "btnDocPreviewNext",
+  };
+}
+
+function updateThumbPagerUi(pagerEl, labelEl, prevBtn, nextBtn, page, total, pageSize) {
+  const tp = total > 0 ? Math.ceil(total / pageSize) : 0;
+  if (!pagerEl || !labelEl) return;
+  if (total > pageSize) {
+    pagerEl.classList.remove("hidden");
+    labelEl.textContent = `Preview page ${page + 1} of ${tp} · ${total} image(s)`;
+  } else if (total > 0) {
+    pagerEl.classList.remove("hidden");
+    labelEl.textContent = `${total} image(s)`;
+  } else {
+    pagerEl.classList.add("hidden");
+    labelEl.textContent = "";
+  }
+  if (prevBtn) prevBtn.disabled = page <= 0 || tp <= 1;
+  if (nextBtn) nextBtn.disabled = page >= tp - 1 || tp <= 1;
+}
+
 /** @returns {{ ok: boolean, count: number }} */
 async function fillDocPreviewInto(summaryEl, stripEl, opts) {
-  const { scope, vf } = opts;
+  const { scope, vf, page = 0, pagerUi = "panel" } = opts;
   clearThumbStrip(stripEl);
+  const offset = page * previewPageSize;
   const res = await fetch(
-    `/api/documents/preview?scope=${encodeURIComponent(scope)}&include_visual_fallback=${vf ? "true" : "false"}`,
+    `/api/documents/preview?scope=${encodeURIComponent(scope)}&include_visual_fallback=${vf ? "true" : "false"}&offset=${offset}&limit=${previewPageSize}`,
   );
   if (!res.ok) {
     const j = await res.json().catch(() => ({}));
@@ -183,7 +473,23 @@ async function fillDocPreviewInto(summaryEl, stripEl, opts) {
   }
   fillMountThumbStrip(stripEl, j.thumbnail_sample_relpaths || []);
   stripEl.classList.toggle("hidden", n === 0);
-  return { ok: true, count: n };
+  const thumbTotal = j.thumbnail_sample_total ?? (j.thumbnail_sample_relpaths || []).length;
+  docPreviewPager.page = page;
+  docPreviewPager.total = thumbTotal;
+  docPreviewPager.scope = scope;
+  docPreviewPager.vf = vf;
+  docPreviewPager.ui = pagerUi;
+  const pe = docThumbPagerElements(pagerUi);
+  updateThumbPagerUi(
+    document.getElementById(pe.pager),
+    document.getElementById(pe.label),
+    document.getElementById(pe.prev),
+    document.getElementById(pe.next),
+    page,
+    thumbTotal,
+    previewPageSize,
+  );
+  return { ok: true, count: n, thumbTotal };
 }
 
 function scheduleDocPanelPreview() {
@@ -212,17 +518,25 @@ async function runDocPanelPreview() {
   const key = `${mountPath}|${scope}|${vf}`;
   if (key === lastDocPreviewKey) return;
   lastDocPreviewKey = key;
+  docPreviewPager.page = 0;
   summaryEl.textContent = "Loading matches…";
-  await fillDocPreviewInto(summaryEl, stripEl, { scope, vf });
+  await fillDocPreviewInto(summaryEl, stripEl, { scope, vf, page: 0 });
 }
 
-async function loadDeletePreviewDialog() {
-  const summary = document.getElementById("deletePreviewSummary");
-  const strip = document.getElementById("deletePreviewStrip");
-  const btnGo = document.getElementById("btnConfirmDelete");
+async function loadDeletePreviewDialog(kind, page = 0) {
+  const wf = workflowCfg(kind);
+  const summary = document.getElementById(wf.deleteSummaryId);
+  const strip = document.getElementById(wf.deleteStripId);
+  const btnGo = document.getElementById(wf.btnConfirmDeleteId);
+  const pagerKey = reviewPagerKey(kind);
+  const sizeFilter = reviewPagerState[pagerKey].sizeFilter || "all";
+  const sfMeta = sizeFilterMeta(sizeFilter);
   clearThumbStrip(strip);
   if (btnGo) btnGo.disabled = true;
-  const res = await fetch("/api/delete/preview");
+  const offset = page * previewPageSize;
+  const res = await fetch(
+    `/api/delete/preview?kind=${encodeURIComponent(wf.kind)}&offset=${offset}&limit=${previewPageSize}&${sizeFilterQueryParam(sizeFilter)}`,
+  );
   if (!res.ok) {
     const j = await res.json().catch(() => ({}));
     summary.textContent = typeof j.detail === "string" ? j.detail : `Preview failed (${res.status}).`;
@@ -237,16 +551,29 @@ async function loadDeletePreviewDialog() {
     summary.innerHTML =
       "<strong>Nothing queued to delete.</strong> In every duplicate group the keeper is the only file, or there are no duplicate groups.";
   } else {
-    summary.innerHTML = `About to remove <strong>${n}</strong> image file(s), freeing roughly <strong>${formatHumanBytes(bytes)}</strong>, across <strong>${gw}</strong> duplicate group(s) that still have extras (of <strong>${dg}</strong> group(s) total).`;
+    summary.innerHTML = `About to remove <strong>${n}</strong> image file(s) from <strong>${sfMeta.deleteScope}</strong>, freeing roughly <strong>${formatHumanBytes(bytes)}</strong>, across <strong>${gw}</strong> group(s) with extras in this view (of <strong>${dg}</strong> group(s) in this view). Other set sizes are not affected.`;
   }
   fillMountThumbStrip(
     strip,
     (j.thumbnail_samples || []).map((x) => x.relpath).filter(Boolean),
   );
+  const thumbTotal = j.thumbnail_sample_total ?? (j.thumbnail_samples || []).length;
+  deletePreviewPager[pagerKey].page = page;
+  deletePreviewPager[pagerKey].total = thumbTotal;
+  const pagerPrefix = pagerKey === "fuzzy" ? "Fuzzy" : "Exact";
+  updateThumbPagerUi(
+    document.getElementById(`delete${pagerPrefix}PreviewPager`),
+    document.getElementById(`delete${pagerPrefix}PreviewPagerLabel`),
+    document.getElementById(`btnDelete${pagerPrefix}PreviewPrev`),
+    document.getElementById(`btnDelete${pagerPrefix}PreviewNext`),
+    page,
+    thumbTotal,
+    previewPageSize,
+  );
   if (btnGo) btnGo.disabled = n === 0;
 }
 
-async function loadDocRemoveDialogPreview() {
+async function loadDocRemoveDialogPreview(page = 0) {
   const scopeEl = document.querySelector('input[name="docScope"]:checked');
   const scope = scopeEl ? scopeEl.value : "older_than_90d";
   const vf = document.getElementById("docVisualFallback").checked;
@@ -254,7 +581,7 @@ async function loadDocRemoveDialogPreview() {
   const strip = document.getElementById("docDlgPreviewStrip");
   const btnGo = document.getElementById("btnDocConfirm");
   if (btnGo) btnGo.disabled = true;
-  const r = await fillDocPreviewInto(summary, strip, { scope, vf });
+  const r = await fillDocPreviewInto(summary, strip, { scope, vf, page, pagerUi: "dlg" });
   if (btnGo) btnGo.disabled = !r.ok || r.count === 0;
 }
 
@@ -338,23 +665,34 @@ function setBanner(text, isError) {
   b.classList.remove("hidden");
 }
 
-function updateDupReviewTeaser(s) {
-  const el = document.getElementById("dupReviewTeaser");
+function updateWorkflowReviewTeaser(s, kind) {
+  const wf = workflowCfg(kind);
+  const el = document.getElementById(wf.teaserId);
   if (!el) return;
-  const gc = typeof s.group_count === "number" ? s.group_count : 0;
+  const gc =
+    typeof s[wf.groupCountSnapshotKey] === "number"
+      ? s[wf.groupCountSnapshotKey]
+      : 0;
   const phase = s.phase || "";
+  const runningKind = s.scan_running_kind || "";
   const hasMount = Boolean(s.mount_path);
-  if (!hasMount) {
-    el.textContent = "Mount the iPhone to run a duplicate scan and open the review panel.";
-  } else if (phase === "scanning") {
-    el.textContent =
-      "Scan in progress — watch the live progress strip at the top for the current file; you can Cancel in step 3 or Unmount in step 6.";
+  const label = kind === "fuzzy" ? "fuzzy burst" : "exact duplicate";
+  if (!hasMount && gc === 0) {
+    el.textContent = `Mount the iPhone to run a ${label} scan, or pick a saved scan above to review without remounting.`;
+  } else if (!hasMount && gc > 0) {
+    el.textContent = `${gc} ${label} group(s) loaded from a saved scan. Open review below (mount the iPhone to see photos and delete files).`;
+  } else if (phase === "scanning" && runningKind === kind) {
+    el.textContent = `${kind === "fuzzy" ? "Fuzzy" : "Exact"} scan in progress — watch the log at the top; use Cancel in this section or Unmount in step 6.`;
   } else if (gc === 0) {
-    el.textContent =
-      "No duplicate groups loaded yet. Use step 3 to scan (optional), or go straight to document cleanup in step 5.";
+    el.textContent = `No ${label} groups loaded yet. Run a scan in this section when ready.`;
   } else {
-    el.textContent = `${gc} duplicate group(s). Open the panel — keep marks start from auto-ranked picks; tap tiles to adjust.`;
+    el.textContent = `${gc} ${label} group(s). Open review — keep marks start from auto-ranked picks; tap tiles to adjust.`;
   }
+}
+
+function updateAllWorkflowReviewTeasers(s) {
+  updateWorkflowReviewTeaser(s, "exact");
+  updateWorkflowReviewTeaser(s, "fuzzy");
 }
 
 /** Drive the numbered guide, button disabled states, and the “Next” line from `/api/status` snapshots. */
@@ -362,20 +700,24 @@ function updateGuidedUI(s) {
   const trusted = Boolean(s.device && s.device.trusted);
   const hasMount = Boolean(s.mount_path);
   const phase = s.phase || "idle";
-  const gc = typeof s.group_count === "number" ? s.group_count : 0;
+  const exactGc = typeof s.exact_group_count === "number" ? s.exact_group_count : 0;
+  const fuzzyGc = typeof s.fuzzy_group_count === "number" ? s.fuzzy_group_count : 0;
   const cancelPending = Boolean(s.scan_cancel_pending);
+  const runningKind = s.scan_running_kind || "";
 
   let current = 1;
-  if (!trusted) {
+  if (phase === "mounting") {
+    current = 2;
+  } else if (!trusted) {
     current = 1;
   } else if (!hasMount) {
     current = 2;
-  } else if (phase === "scanning") {
-    current = 3;
-  } else if (phase === "mounted") {
+  } else if (phase === "scanning" && runningKind === "fuzzy") {
+    current = 4;
+  } else if (phase === "scanning" || phase === "mounted") {
     current = 3;
   } else if (phase === "reviewing" || phase === "deleting") {
-    current = 4;
+    current = exactGc > 0 || fuzzyGc > 0 ? 3 : 5;
   } else if (phase === "unmounting") {
     current = 6;
   } else {
@@ -397,31 +739,35 @@ function updateGuidedUI(s) {
   });
 
   const na = document.getElementById("nextAction");
+  if (!na) return;
   let next = "";
   if (!trusted) {
     next = "Connect USB, unlock the iPhone, tap Trust if asked, then check the device.";
   } else if (!hasMount) {
     next =
       phase === "mounting"
-        ? "Mounting — watch the live progress strip and activity log at the top of the page."
+        ? "Mounting — status and log at the top refresh every 5 seconds."
         : "Mount iPhone media so this Mac can read your library.";
   } else if (phase === "scanning") {
+    const which = runningKind === "fuzzy" ? "Fuzzy roll" : runningKind === "exact" ? "Exact duplicate" : "Scan";
     next = cancelPending
-      ? "Stop requested — the scan exits quickly between photos; when the phase shows Mounted or Reviewing again, you can start another scan, use document cleanup, or unmount."
-      : "Scan running — live file-by-file progress is at the top. Use Cancel scan in step 3 to stop, or Unmount in step 6 to disconnect (that also cancels the scan).";
+      ? `Stop requested — ${which} scan exits quickly between photos; when idle you can use the other workflow section or unmount.`
+      : `${which} scan running — each file is logged at the top. Cancel in that workflow section below, or Unmount in step 6.`;
   } else if (phase === "mounted") {
     next =
-      "Optional: run an exact duplicate scan or a fuzzy roll scan, or scroll down for document cleanup. Unmount before unplugging.";
+      "Optional: use Exact duplicate photos or Fuzzy roll sections below (separate workflows), or document cleanup. Unmount before unplugging.";
   } else if (phase === "reviewing") {
-    if (gc > 0) {
-      next =
-        "Open duplicate review: keep marks start from auto-ranked picks; tap tiles to change them (multiple per group). Delete only removes unmarked files. If every file in a group is kept, that group is skipped.";
+    if (exactGc > 0 || fuzzyGc > 0) {
+      const parts = [];
+      if (exactGc > 0) parts.push(`${exactGc} exact group(s)`);
+      if (fuzzyGc > 0) parts.push(`${fuzzyGc} fuzzy group(s)`);
+      next = `Review in each workflow section (${parts.join(", ")}). Delete only removes unmarked files per workflow.`;
     } else {
-      next = "No groups from the last scan — document cleanup below is optional, then unmount when done.";
+      next = "No duplicate groups loaded — document cleanup below is optional, then unmount when done.";
     }
   } else if (phase === "deleting") {
     next =
-      "Deletion running — watch the live progress strip at the top. Unmount in step 6 stays available if you need to disconnect (close Finder windows on the iPhone volume first; if the volume is busy, wait a moment and retry).";
+      "Deletion running — status and log at the top refresh every 5 seconds. Unmount in step 6 stays available if you need to disconnect (close Finder windows on the iPhone volume first; if the volume is busy, wait a moment and retry).";
   } else if (phase === "unmounting") {
     next = "Unmounting…";
   } else if (hasMount) {
@@ -435,72 +781,122 @@ function updateGuidedUI(s) {
     hasMount && (phase === "mounted" || phase === "reviewing") && phase !== "scanning";
   const mountBusy =
     phase === "mounting" || phase === "scanning" || phase === "deleting" || phase === "unmounting";
-  document.getElementById("btnMount").disabled = !trusted || mountBusy;
-  document.getElementById("btnScan").disabled = !canStartScan;
+  const btnMount = document.getElementById("btnMount");
+  if (btnMount) btnMount.disabled = !trusted || mountBusy;
+
+  const exactBtn = document.getElementById("btnScan");
+  if (exactBtn) exactBtn.disabled = !canStartScan;
   const fuzzyBtn = document.getElementById("btnScanFuzzy");
   if (fuzzyBtn) fuzzyBtn.disabled = !canStartScan;
-  const scanCancelBtn = document.getElementById("btnScanCancel");
-  if (scanCancelBtn) {
-    scanCancelBtn.disabled = phase !== "scanning";
-    scanCancelBtn.textContent = cancelPending ? "Stopping…" : "Cancel scan";
+  const exactCancel = document.getElementById("btnScanCancelExact");
+  if (exactCancel) {
+    exactCancel.disabled = phase !== "scanning" || runningKind !== "exact";
+    exactCancel.textContent = cancelPending && runningKind === "exact" ? "Stopping…" : "Cancel exact scan";
+  }
+  const fuzzyCancel = document.getElementById("btnScanCancelFuzzy");
+  if (fuzzyCancel) {
+    fuzzyCancel.disabled = phase !== "scanning" || runningKind !== "fuzzy";
+    fuzzyCancel.textContent = cancelPending && runningKind === "fuzzy" ? "Stopping…" : "Cancel fuzzy scan";
   }
 
-  const scanRunHint = document.getElementById("scanRunHint");
-  if (scanRunHint) {
+  const exactHint = document.getElementById("exactScanRunHint");
+  if (exactHint) {
     if (phase === "mounting") {
-      scanRunHint.textContent =
-        "Mount in progress — duplicate scans stay disabled until the phase shows Mounted.";
-    } else if (phase === "scanning") {
-      scanRunHint.textContent = cancelPending
-        ? "Stop requested — the worker checks often between photos and filesystem steps, so this usually clears in a moment."
-        : "Only one scan runs at a time (exact or fuzzy). Starting the other mode cancels the current run; Cancel stops without starting another.";
-    } else if (phase === "mounted" || phase === "reviewing") {
-      const bs = typeof s.fuzzy_roll_batch_size === "number" ? s.fuzzy_roll_batch_size : 1000;
-      const fzTotal = typeof s.fuzzy_roll_total === "number" ? s.fuzzy_roll_total : null;
-      const fzNext = typeof s.fuzzy_roll_next_start === "number" ? s.fuzzy_roll_next_start : 0;
-      const fzEx = Boolean(s.fuzzy_roll_exhausted);
-      let fuzzyExtra = "";
-      if (fzTotal != null && fzTotal > 0) {
-        fuzzyExtra = fzEx
-          ? ` Fuzzy: finished all ${fzTotal} indexed photos in slices of ~${bs}; use API ?kind=fuzzy&fuzzy_restart=true to clear fuzzy groups and start over from the top (reuses cached hashes).`
-          : ` Fuzzy: next batch starts at photo index ${fzNext} of ${fzTotal} (~${bs} per run).`;
-      }
-      scanRunHint.textContent =
-        `Exact = same-size near-identical dupes. Fuzzy roll = similar adjacent shots in capture-time order, ~${bs} photos hashed/analyzed per click; hashes persist between runs.` +
-        fuzzyExtra;
+      exactHint.textContent = "Mount in progress — exact scan stays disabled until Mounted.";
+    } else if (phase === "scanning" && runningKind === "exact") {
+      exactHint.textContent = cancelPending
+        ? "Stop requested — exact scan exits quickly between photos."
+        : "Exact scan running — same-size near-identical files. Only this workflow’s cancel applies.";
+    } else if (phase === "scanning" && runningKind === "fuzzy") {
+      exactHint.textContent = "Fuzzy scan is running — wait for it to finish or cancel it in the Fuzzy roll section.";
+    } else if (canStartScan) {
+      exactHint.textContent =
+        `Finds same-size near-identical duplicates across the library (full walk; fine for 10k–100k+ photos).${libraryIndexLabel(s)} Independent from fuzzy roll below.`;
     } else {
-      scanRunHint.textContent = "";
+      exactHint.textContent = "";
     }
   }
 
-  const dupOpen = document.getElementById("btnDupReviewOpen");
-  if (dupOpen) {
-    dupOpen.disabled =
-      !hasMount || phase === "deleting" || phase === "unmounting" || phase === "mounting";
+  const fuzzyHint = document.getElementById("fuzzyScanRunHint");
+  if (fuzzyHint) {
+    const bs = typeof s.fuzzy_roll_batch_size === "number" ? s.fuzzy_roll_batch_size : 0;
+    const fzTotal = typeof s.fuzzy_roll_total === "number" ? s.fuzzy_roll_total : null;
+    const fzNext = typeof s.fuzzy_roll_next_start === "number" ? s.fuzzy_roll_next_start : 0;
+    const fzEx = Boolean(s.fuzzy_roll_exhausted);
+    if (phase === "mounting") {
+      fuzzyHint.textContent = "Mount in progress — fuzzy scan stays disabled until Mounted.";
+    } else if (phase === "scanning" && runningKind === "fuzzy") {
+      fuzzyHint.textContent = cancelPending
+        ? "Stop requested — fuzzy batch exits quickly between photos."
+        : bs <= 0
+          ? "Fuzzy scan running — entire library in one pass (capture-time order)."
+          : `Fuzzy batch running — ~${bs} photos per click in capture-time order.`;
+    } else if (phase === "scanning" && runningKind === "exact") {
+      fuzzyHint.textContent = "Exact scan is running — wait for it to finish or cancel it in the Exact duplicate section.";
+    } else if (canStartScan) {
+      let progress = "";
+      if (fzTotal != null && fzTotal > 0) {
+        progress = fzEx
+          ? ` Roll fully indexed (${fzTotal} photos). Run Fuzzy roll scan again to clear fuzzy groups and rescan (reuses cached hashes).`
+          : ` Next batch: photo index ${fzNext} of ${fzTotal} (~${bs} per run).`;
+      }
+      const batchNote =
+        bs <= 0
+          ? " One click scans every photo on the mount (features cached on this Mac for faster re-runs)."
+          : " Large libraries: run batches until the roll is fully indexed.";
+      fuzzyHint.textContent =
+        `Bursts and same-scene color sets in capture-time order (~2 min gap max between shots).${libraryIndexLabel(s)}${progress}${batchNote}`;
+    } else {
+      fuzzyHint.textContent = "";
+    }
   }
 
   const mountNeeded = !hasMount;
+  for (const kind of ["exact", "fuzzy"]) {
+    const wf = workflowCfg(kind);
+    const gc = kind === "fuzzy" ? fuzzyGc : exactGc;
+    const dupOpen = document.getElementById(wf.btnOpenId);
+    if (dupOpen) {
+      dupOpen.disabled =
+        gc === 0 || phase === "deleting" || phase === "unmounting" || phase === "mounting";
+    }
+    const delBtn = document.getElementById(wf.btnDeleteId);
+    if (delBtn) {
+      delBtn.disabled =
+        mountNeeded ||
+        gc === 0 ||
+        phase === "scanning" ||
+        phase === "deleting" ||
+        phase === "mounting";
+    }
+  }
   const docFs = document.getElementById("docScopeFieldset");
   if (docFs) docFs.disabled = mountNeeded;
 
   ["btnDocRemove", "btnDocUndo", "btnDocFinalize"].forEach((id) => {
     document.getElementById(id).disabled = mountNeeded;
   });
-  document.getElementById("btnDelete").disabled =
-    mountNeeded || gc === 0 || phase === "scanning" || phase === "deleting" || phase === "mounting";
 }
 
 function relPath(fullPath, mount) {
   if (!mount || !fullPath) return "";
-  const m = mount.endsWith("/") ? mount.slice(0, -1) : mount;
-  if (!fullPath.startsWith(m)) return "";
-  const rest = fullPath.slice(m.length);
-  return rest.startsWith("/") ? rest.slice(1) : rest;
+  const m = String(mount).replace(/\/+$/, "");
+  const fp = String(fullPath).replace(/\/+$/, "");
+  if (fp === m) return "";
+  if (fp.startsWith(`${m}/`)) return fp.slice(m.length + 1);
+  return "";
+}
+
+function reviewThumbRel(fullPath, relpaths, index) {
+  const fromApi = Array.isArray(relpaths) ? relpaths[index] : "";
+  if (fromApi) return fromApi;
+  return relPath(fullPath, mountPath) || relPath(fullPath, thumbnailMountRoot);
 }
 
 function updateLastDelete(ledger) {
   const panel = document.getElementById("lastDeletePanel");
   const body = document.getElementById("lastDeleteBody");
+  if (!panel || !body) return;
   if (!ledger || ledger.deleted_count == null) {
     panel.classList.add("hidden");
     return;
@@ -515,6 +911,7 @@ function updateLastDelete(ledger) {
 
 function updateDocumentBatchInfo(snapshot) {
   const el = document.getElementById("docBatchInfo");
+  if (!el) return;
   const batches = snapshot.document_batches || [];
   if (!batches.length) {
     el.textContent = "No files waiting in the Mac holding area (undo buffer).";
@@ -527,6 +924,7 @@ function updateDocumentBatchInfo(snapshot) {
 function updateDocumentLedger(snapshot) {
   const panel = document.getElementById("docLedgerPanel");
   const body = document.getElementById("docLedgerBody");
+  if (!panel || !body) return;
   const ledger = snapshot.document_last_ledger;
   if (!ledger || ledger.removed_from_device == null) {
     panel.classList.add("hidden");
@@ -540,24 +938,181 @@ function updateDocumentLedger(snapshot) {
   body.textContent = t;
 }
 
+function scrollToWorkflowPanel(kind) {
+  const wf = workflowCfg(kind);
+  const panel = document.getElementById(wf.panelId);
+  if (panel) {
+    panel.scrollIntoView({ behavior: "smooth", block: "start" });
+    const btn = document.getElementById(wf.btnScanId);
+    if (btn && !btn.disabled) btn.focus({ preventScroll: true });
+  }
+}
+
+function setScanWorkspaceLoading(kind, on) {
+  const wf = workflowCfg(kind);
+  if (kind === "fuzzy") scanSessionsLoadingFuzzy = on;
+  else scanSessionsLoadingExact = on;
+  const wrap = document.getElementById(wf.loadingId);
+  if (!wrap) return;
+  wrap.classList.toggle("hidden", !on);
+  wrap.setAttribute("aria-busy", on ? "true" : "false");
+}
+
+function scanSessionsLoadingFor(kind) {
+  return kind === "fuzzy" ? scanSessionsLoadingFuzzy : scanSessionsLoadingExact;
+}
+
+function renderScanSessionList(kind, sessions, activeId) {
+  const wf = workflowCfg(kind);
+  const list = document.getElementById(wf.sessionListId);
+  const empty = document.getElementById(wf.emptyId);
+  if (!list || !empty) return;
+  setActiveSessionIdFor(kind, activeId || "");
+  list.innerHTML = "";
+  const items = sessions || [];
+  empty.classList.toggle("hidden", items.length > 0);
+  list.classList.toggle("hidden", items.length === 0);
+  for (const sess of items) {
+    const sid = String(sess.id || "");
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "scan-session-item";
+    btn.setAttribute("role", "option");
+    btn.setAttribute("aria-selected", sid === activeSessionIdFor(kind) ? "true" : "false");
+    if (sid === activeSessionIdFor(kind)) btn.classList.add("active");
+    const gc = sess.group_count ?? 0;
+    const active = sid === activeSessionIdFor(kind);
+    btn.innerHTML = `<span class="scan-session-item-title">${sess.label || sid}</span><span class="scan-session-item-meta">${gc} group(s)${active ? " · active" : ""} — click to load &amp; review</span>`;
+    btn.addEventListener("click", () => activateScanSession(kind, sid));
+    list.appendChild(btn);
+  }
+}
+
+async function fetchScanSessions(kind) {
+  const res = await fetch(`/api/scan/sessions?kind=${encodeURIComponent(kind)}`);
+  if (!res.ok) return null;
+  return res.json();
+}
+
+async function refreshScanSessions(kind, preferredActiveId) {
+  const data = await fetchScanSessions(kind);
+  if (!data) return;
+  const active = preferredActiveId || data.active_session_id || "";
+  renderScanSessionList(kind, data.sessions || [], active);
+}
+
+async function refreshAllScanSessions(preferred) {
+  await refreshScanSessions("exact", preferred?.exact);
+  await refreshScanSessions("fuzzy", preferred?.fuzzy);
+}
+
+async function activateScanSession(kind, sessionId) {
+  if (!sessionId || scanSessionsLoadingFor(kind)) return;
+  const reopenOnly = sessionId === activeSessionIdFor(kind);
+  setScanWorkspaceLoading(kind, true);
+  const wf = workflowCfg(kind);
+  document.querySelectorAll(`#${wf.sessionListId} .scan-session-item`).forEach((el) => {
+    el.disabled = true;
+  });
+  try {
+    if (!reopenOnly) {
+      const res = await fetch("/api/scan/sessions/activate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId }),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        toast(typeof j.detail === "string" ? j.detail : `Could not load scan (${res.status}).`);
+        return;
+      }
+      await refreshAllScanSessions({ [kind]: sessionId });
+      const kindCount =
+        typeof j.kind_group_count === "number"
+          ? j.kind_group_count
+          : kind === "fuzzy"
+            ? j.fuzzy_group_count
+            : j.exact_group_count;
+      await refreshStatusFromServer();
+      if ((kindCount ?? 0) > 0) {
+        await openPagedReview(kind, { page: 0 });
+        toast(j.session?.label ? `Loaded ${j.session.label}` : "Scan loaded — review opened.");
+      } else {
+        toast(
+          j.session?.label
+            ? `${j.session.label} has no duplicate groups yet. Mount the phone and run a new scan to refresh it.`
+            : "Scan loaded but has no groups — run a new scan when the phone is mounted.",
+        );
+      }
+      return;
+    }
+    await refreshAllScanSessions({ [kind]: sessionId });
+    const snap = lastSnapshot || (await fetchStatusSnapshot());
+    const gc =
+      kind === "fuzzy"
+        ? snap?.fuzzy_group_count ?? 0
+        : snap?.exact_group_count ?? 0;
+    if (gc > 0) {
+      await openPagedReview(kind, { page: 0 });
+      toast("Review opened for the active saved scan.");
+    } else {
+      toast("This saved scan has no duplicate groups. Run a new scan when the phone is mounted.");
+    }
+  } finally {
+    setScanWorkspaceLoading(kind, false);
+    document.querySelectorAll(`#${wf.sessionListId} .scan-session-item`).forEach((el) => {
+      el.disabled = false;
+    });
+  }
+}
+
 function applySnapshot(s) {
+  if (!s || typeof s !== "object") return;
+  renderUnifiedActivityHub(s);
+
+  const phaseEl = document.getElementById("phase");
+  if (phaseEl) phaseEl.textContent = s.phase || "unknown";
+
+  if (typeof s.groups_page_size === "number" && s.groups_page_size > 0) {
+    groupsPageSize = s.groups_page_size;
+  }
+  if (typeof s.review_thumbnail_max_edge === "number" && s.review_thumbnail_max_edge > 0) {
+    reviewThumbEdge = s.review_thumbnail_max_edge;
+  }
+  if (typeof s.preview_page_size === "number" && s.preview_page_size > 0) {
+    previewPageSize = s.preview_page_size;
+  }
+  if (typeof s.images_per_group_page === "number" && s.images_per_group_page > 0) {
+    imagesPerGroupPage = s.images_per_group_page;
+  }
   const mp = s.mount_path || "";
+  const exactActive = s.active_exact_scan_session_id || "";
+  const fuzzyActive = s.active_fuzzy_scan_session_id || "";
+  if (exactActive !== activeExactScanSessionId || fuzzyActive !== activeFuzzyScanSessionId) {
+    activeExactScanSessionId = exactActive;
+    activeFuzzyScanSessionId = fuzzyActive;
+    refreshAllScanSessions({ exact: exactActive, fuzzy: fuzzyActive });
+  }
   if (mp !== lastMountForDoc) {
     lastMountForDoc = mp;
     lastDocPreviewKey = "";
   }
   lastDocumentBatches = s.document_batches || [];
 
-  document.getElementById("phase").textContent = s.phase || "unknown";
   mountPath = s.mount_path || "";
-  document.getElementById("mount").textContent = mountPath || "—";
+  thumbnailMountRoot = s.configured_mount_point || mountPath || "";
+  const mountEl = document.getElementById("mount");
+  if (mountEl) mountEl.textContent = mountPath || "—";
   const dev = s.device;
-  if (dev && dev.trusted) {
-    document.getElementById("device").textContent = `${dev.name || "iPhone"} (${dev.udid || ""})`;
-  } else if (dev && dev.error) {
-    document.getElementById("device").textContent = dev.error;
-  } else {
-    document.getElementById("device").textContent = "Not connected / not trusted";
+  const deviceEl = document.getElementById("device");
+  if (deviceEl) {
+    if (dev && dev.trusted) {
+      deviceEl.textContent = `${dev.name || "iPhone"} (${dev.udid || ""})`;
+    } else if (dev && dev.error) {
+      deviceEl.textContent = dev.error;
+    } else {
+      deviceEl.textContent = "Not connected / not trusted";
+    }
   }
   if (s.last_error) {
     setBanner(s.last_error, true);
@@ -567,12 +1122,29 @@ function applySnapshot(s) {
   updateLastDelete(s.last_delete_ledger);
   updateDocumentBatchInfo(s);
   updateDocumentLedger(s);
-  renderActivityHub(s);
-  renderActivityDiagnostics(s);
-  updateDupReviewTeaser(s);
+  markRefreshed(s);
+  updateAllWorkflowReviewTeasers(s);
+  lastSnapshot = s;
   if (s.phase && s.phase !== lastPhase) {
-    if (s.phase === "mounted") toast("iPhone media mounted.");
-    else if (s.phase === "reviewing" && lastPhase === "scanning") toast("Duplicate scan finished.");
+    if (
+      s.phase === "mounted" &&
+      lastPhase &&
+      (lastPhase === "mounting" || lastPhase === "device_detected" || lastPhase === "idle")
+    ) {
+      toast("iPhone media mounted.");
+    } else if (s.phase === "reviewing" && lastPhase === "scanning") {
+      const rk = s.scan_running_kind || lastScanKind || "exact";
+      const count = rk === "fuzzy" ? s.fuzzy_group_count : s.exact_group_count;
+      toast(rk === "fuzzy" ? "Fuzzy roll batch finished." : "Exact duplicate scan finished.");
+      refreshAllScanSessions({
+        exact: s.active_exact_scan_session_id,
+        fuzzy: s.active_fuzzy_scan_session_id,
+      });
+      if (autoReviewEnabled && count > 0) {
+        openPagedReview(rk, { page: 0 });
+      }
+    }
+    if (s.phase === "scanning" && s.scan_running_kind) lastScanKind = s.scan_running_kind;
     lastPhase = s.phase;
   }
   updateGuidedUI(s);
@@ -583,93 +1155,276 @@ function applySnapshot(s) {
   }
 }
 
-async function loadGroups() {
-  const res = await fetch("/api/scan/groups");
-  if (!res.ok) return;
-  const data = await res.json();
-  const root = document.getElementById("groups");
-  if (!root) return;
-  root.innerHTML = "";
-  const groups = data.groups || [];
-  const keep = data.keep || {};
-  for (const g of groups) {
-    const wrap = document.createElement("section");
-    wrap.className = "group";
-    const paths = g.paths || [];
-    const rawK = keep[g.id];
-    const keepList = Array.isArray(rawK) ? rawK : rawK ? [rawK] : [];
-    const keepSet = new Set(keepList);
-    const nk = keepSet.size;
-    const sk = g.scan_kind === "fuzzy" ? "Fuzzy burst · " : "";
-    const suffix =
-      nk === paths.length && paths.length > 0 ? " — all marked keep (no deletes here)" : "";
 
-    const header = document.createElement("div");
-    header.className = "group-header";
-    const titleText = document.createElement("div");
-    titleText.className = "group-title-text";
-    titleText.textContent = `${sk}Group ${g.id} · ${nk}/${paths.length} marked keep · save ~${Math.round((g.bytesSavedIfOneKept || 0) / 1024)} KB if only largest kept${suffix}`;
-    const btnKeepAll = document.createElement("button");
-    btnKeepAll.type = "button";
-    btnKeepAll.className = "ghost keep-all-in-group";
-    btnKeepAll.textContent = "Keep all in group";
-    btnKeepAll.title =
-      "Mark every image in this group as keep. You can still click tiles below to remove keep from individual photos.";
-    btnKeepAll.setAttribute("aria-label", `Keep all ${paths.length} images in group ${g.id}`);
-    btnKeepAll.disabled = paths.length === 0;
-    btnKeepAll.addEventListener("click", async (ev) => {
-      ev.preventDefault();
-      ev.stopPropagation();
-      if (!paths.length) return;
-      await fetch("/api/selection", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ group_id: g.id, keep_paths: [...paths] }),
-      });
-      await loadGroups();
-    });
-    header.appendChild(titleText);
-    header.appendChild(btnKeepAll);
-
-    const tiles = document.createElement("div");
-    tiles.className = "tiles";
-    for (const p of paths) {
-      const tile = document.createElement("div");
-      tile.className = "tile";
-      const rel = relPath(p, mountPath);
-      const sel = keepSet.has(p);
-      if (sel) tile.classList.add("selected");
-      const mark = document.createElement("span");
-      mark.className = "tile-keep-mark";
-      mark.setAttribute("aria-hidden", "true");
-      mark.textContent = sel ? "✓" : "";
-      const img = document.createElement("img");
-      img.loading = "lazy";
-      if (rel) {
-        img.src = `/api/thumbnail?relpath=${encodeURIComponent(rel)}&max_edge=512`;
-      }
-      img.alt = p.split("/").pop() || "photo";
-      const cap = document.createElement("div");
-      cap.className = "cap";
-      cap.textContent = p.split("/").pop() || p;
-      tile.appendChild(mark);
-      tile.appendChild(img);
-      tile.appendChild(cap);
-      tile.addEventListener("click", async () => {
-        await fetch("/api/selection", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ group_id: g.id, toggle_path: p }),
-        });
-        await loadGroups();
-      });
-      tiles.appendChild(tile);
+function updateReviewSizeFilterUi(kind) {
+  const wf = workflowCfg(kind);
+  const key = reviewPagerKey(kind);
+  const st = reviewPagerState[key];
+  const meta = sizeFilterMeta(st.sizeFilter);
+  const slider = document.getElementById(wf.sizeSliderId);
+  const valueEl = document.getElementById(wf.sizeValueId);
+  const hintEl = document.getElementById(wf.sizeHintId);
+  const btnDel = document.getElementById(wf.btnDeleteId);
+  const idx = sliderIndexFromSizeFilter(st.sizeFilter);
+  if (slider) {
+    slider.value = String(idx);
+    slider.setAttribute("aria-valuenow", String(idx));
+  }
+  if (valueEl) valueEl.textContent = meta.label;
+  const counts = st.sizeCounts || {};
+  const inView = st.total ?? counts[st.sizeFilter] ?? counts.all ?? 0;
+  if (hintEl) {
+    if (st.sizeFilter === "all") {
+      hintEl.textContent =
+        counts.all != null
+          ? `${counts.all} set(s) total · delete affects every set where you left extras un-kept.`
+          : "Delete affects every set where you left extras un-kept.";
+    } else {
+      const bucket = counts[st.sizeFilter] ?? 0;
+      hintEl.textContent = `${inView} set(s) in this view (${bucket} with ${meta.short} in scan). Delete and keep changes apply only here — other sizes are untouched.`;
     }
-    wrap.appendChild(header);
-    wrap.appendChild(tiles);
-    root.appendChild(wrap);
+  }
+  if (btnDel) {
+    const kindLabel = wf.kind === "fuzzy" ? "fuzzy bursts" : "exact duplicates";
+    btnDel.textContent =
+      st.sizeFilter === "all"
+        ? `Delete non-kept ${kindLabel}…`
+        : `Delete non-kept (${meta.short} only)…`;
   }
 }
+
+function updateGroupsPagerUi(kind) {
+  const wf = workflowCfg(kind);
+  const st = reviewPagerState[reviewPagerKey(kind)];
+  const pager = document.getElementById(`${kind === "fuzzy" ? "fuzzy" : "exact"}GroupsPager`);
+  const label = document.getElementById(wf.pagerLabelId);
+  const prev = document.getElementById(wf.pagerPrevId);
+  const next = document.getElementById(wf.pagerNextId);
+  const tp = reviewTotalPages(st.total);
+  if (!pager || !label) return;
+  const sf = sizeFilterMeta(st.sizeFilter);
+  if (st.total > 0 && tp > 1) {
+    pager.classList.remove("hidden");
+    label.textContent = `Page ${st.page + 1} of ${tp} · ${st.total} ${sf.short} set(s)`;
+  } else if (st.total > 0) {
+    pager.classList.remove("hidden");
+    label.textContent = `${st.total} ${sf.short} set(s) on this page — scroll each row to compare photos`;
+  } else {
+    pager.classList.add("hidden");
+    label.textContent = "No groups on this scan";
+  }
+  if (prev) prev.disabled = st.loading || st.page <= 0 || tp <= 1;
+  if (next) next.disabled = st.loading || st.page >= tp - 1 || tp <= 1;
+}
+
+function renderOneGroup(kind, g, keep) {
+  const paths = g.paths || [];
+  const rawK = keep[g.id];
+  const keepList = Array.isArray(rawK) ? rawK : rawK ? [rawK] : [];
+  const keepSet = new Set(keepList);
+  const nk = keepSet.size;
+  let sk = "";
+  if (g.scan_kind === "fuzzy") {
+    const reasonLabels = {
+      visual: "Burst",
+      palette: "Same palette",
+      color: "Color match",
+      grid_exact: "Scene grid",
+      mixed: "Mixed",
+    };
+    const r = g.fuzzy_match_reason;
+    const label = reasonLabels[r] || "Fuzzy set";
+    const mod = g.fuzzy_link_strength === "moderate" ? " · moderate" : "";
+    sk = `${label}${mod} · `;
+  }
+  const suffix =
+    nk === paths.length && paths.length > 0 ? " — all marked keep (no deletes here)" : "";
+
+  const section = document.createElement("section");
+  section.className = "review-set group";
+  section.dataset.groupId = String(g.id);
+
+  const header = document.createElement("div");
+  header.className = "review-set-header group-header";
+  const titleText = document.createElement("span");
+  titleText.className = "group-title-text";
+  titleText.textContent = `${sk}Set ${g.id} · ${nk}/${paths.length} keep · ~${Math.round((g.bytesSavedIfOneKept || 0) / 1024)} KB${suffix}`;
+  const btnKeepAll = document.createElement("button");
+  btnKeepAll.type = "button";
+  btnKeepAll.className = "ghost keep-all-in-group";
+  btnKeepAll.textContent = "Keep all in set";
+  btnKeepAll.addEventListener("click", async (ev) => {
+    ev.preventDefault();
+    if (!paths.length) return;
+    await fetch("/api/selection", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ group_id: g.id, keep_paths: [...paths] }),
+    });
+    await loadReviewPage(kind, reviewPagerState[kind === "fuzzy" ? "fuzzy" : "exact"].page);
+  });
+  header.appendChild(titleText);
+  header.appendChild(btnKeepAll);
+
+  const tiles = document.createElement("div");
+  tiles.className = "tiles review-set-photos";
+  tiles.style.setProperty("--set-photo-count", String(Math.max(paths.length, 1)));
+  tiles.setAttribute("role", "list");
+  tiles.setAttribute("aria-label", `Photos in set ${g.id}`);
+
+  const relpaths = g.relpaths || [];
+
+  for (let pi = 0; pi < paths.length; pi += 1) {
+    const p = paths[pi];
+    const tile = document.createElement("div");
+    tile.className = "tile review-photo-tile";
+    tile.setAttribute("role", "listitem");
+    const rel = reviewThumbRel(p, relpaths, pi);
+    const sel = keepSet.has(p);
+    if (sel) tile.classList.add("selected");
+    tile.setAttribute("aria-pressed", sel ? "true" : "false");
+    tile.setAttribute("aria-label", `${sel ? "Keeping" : "Not keeping"} ${p.split("/").pop() || p}`);
+
+    const mark = document.createElement("span");
+    mark.className = "tile-keep-mark";
+    mark.setAttribute("aria-hidden", "true");
+    mark.textContent = sel ? "✓" : "";
+
+    const media = document.createElement("div");
+    media.className = "tile-media";
+    const img = document.createElement("img");
+    img.className = "review-photo-img";
+    img.loading = "lazy";
+    img.decoding = "async";
+    const baseName = p.split("/").pop() || "photo";
+    if (rel) {
+      img.src = `/api/thumbnail?relpath=${encodeURIComponent(rel)}&max_edge=${reviewThumbEdge}`;
+      img.alt = baseName;
+    } else {
+      img.classList.add("review-photo-missing");
+      img.alt = `${baseName} — mount the iPhone to load this photo.`;
+    }
+    media.appendChild(img);
+
+    const cap = document.createElement("div");
+    cap.className = "cap";
+    cap.textContent = p.split("/").pop() || p;
+
+    tile.appendChild(mark);
+    tile.appendChild(media);
+    tile.appendChild(cap);
+    tile.addEventListener("click", async () => {
+      const res = await fetch("/api/selection", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ group_id: g.id, toggle_path: p }),
+      });
+      if (!res.ok) return;
+      const nowSel = !tile.classList.contains("selected");
+      tile.classList.toggle("selected", nowSel);
+      tile.setAttribute("aria-pressed", nowSel ? "true" : "false");
+      tile.setAttribute(
+        "aria-label",
+        `${nowSel ? "Keeping" : "Not keeping"} ${p.split("/").pop() || p}`,
+      );
+      mark.textContent = nowSel ? "✓" : "";
+    });
+    tiles.appendChild(tile);
+  }
+
+  section.appendChild(header);
+  section.appendChild(tiles);
+  return section;
+}
+
+async function loadReviewPage(kind, page, opts = {}) {
+  const wf = workflowCfg(kind);
+  const key = reviewPagerKey(kind);
+  const st = reviewPagerState[key];
+  const root = document.getElementById(wf.groupsId);
+  if (!root || st.loading) return;
+  st.loading = true;
+  updateGroupsPagerUi(kind);
+  updateReviewSizeFilterUi(kind);
+  try {
+    const offset = page * groupsPageSize;
+    const res = await fetch(
+      `/api/scan/groups?kind=${encodeURIComponent(wf.kind)}&offset=${offset}&limit=${groupsPageSize}&${sizeFilterQueryParam(st.sizeFilter)}`,
+    );
+    if (!res.ok) return;
+    const data = await res.json();
+    const groups = data.groups || [];
+    const keep = data.keep || {};
+    st.total = typeof data.total === "number" ? data.total : groups.length;
+    st.page = clampReviewPage(page, st.total);
+    if (data.size_counts) st.sizeCounts = data.size_counts;
+    if (data.size_filter) st.sizeFilter = data.size_filter;
+    root.innerHTML = "";
+    if (!groups.length) {
+      const empty = document.createElement("p");
+      empty.className = "hint muted review-page-empty";
+      const sf = sizeFilterMeta(st.sizeFilter);
+      empty.textContent =
+        st.sizeFilter === "all"
+          ? "No duplicate groups on this page."
+          : `No ${sf.short} sets on this page. Try another size or All.`;
+      root.appendChild(empty);
+    }
+    for (const g of groups) {
+      root.appendChild(renderOneGroup(kind, g, keep));
+    }
+    root.scrollTop = 0;
+    const title = document.getElementById(wf.titleId);
+    if (title) {
+      const tp = reviewTotalPages(st.total);
+      const sf = sizeFilterMeta(st.sizeFilter);
+      title.textContent =
+        wf.kind === "fuzzy"
+          ? `Fuzzy burst review · ${sf.short} · page ${st.page + 1}${tp ? ` of ${tp}` : ""}`
+          : `Exact duplicate review · ${sf.short} · page ${st.page + 1}${tp ? ` of ${tp}` : ""}`;
+    }
+  } finally {
+    st.loading = false;
+    updateGroupsPagerUi(kind);
+    updateReviewSizeFilterUi(kind);
+  }
+}
+
+async function setReviewSizeFilter(kind, filterId, opts = {}) {
+  const key = reviewPagerKey(kind);
+  const st = reviewPagerState[key];
+  const next = REVIEW_SIZE_FILTERS.some((x) => x.id === filterId) ? filterId : "all";
+  if (st.sizeFilter === next && !opts.force) return;
+  st.sizeFilter = next;
+  st.page = 0;
+  deletePreviewPager[key].page = 0;
+  await loadReviewPage(kind, 0);
+}
+
+async function openPagedReview(kind, opts = {}) {
+  const wf = workflowCfg(kind);
+  const dlg = document.getElementById(wf.dlgId);
+  const key = reviewPagerKey(kind);
+  const st = reviewPagerState[key];
+  const page = typeof opts.page === "number" ? opts.page : 0;
+  if (opts.sizeFilter) st.sizeFilter = opts.sizeFilter;
+  const slider = document.getElementById(workflowCfg(kind).sizeSliderId);
+  if (slider) slider.value = String(sliderIndexFromSizeFilter(st.sizeFilter));
+  await loadReviewPage(kind, page);
+  if (dlg && (opts.showDialog !== false)) {
+    if (!dlg.open) dlg.showModal();
+    st.dialogOpen = true;
+  }
+}
+
+async function gotoReviewPage(kind, delta) {
+  const key = reviewPagerKey(kind);
+  const st = reviewPagerState[key];
+  const next = clampReviewPage(st.page + delta, st.total);
+  if (next === st.page) return;
+  await loadReviewPage(kind, next);
+}
+
 
 function wireStepJumps() {
   document.querySelectorAll(".step-jump").forEach((el) => {
@@ -689,17 +1444,166 @@ function wireStepJumps() {
   });
 }
 
-async function refreshStatusFromServer() {
+async function fetchStatusSnapshot() {
+  const ctrl = new AbortController();
+  const timer = window.setTimeout(() => ctrl.abort(), STATUS_FETCH_TIMEOUT_MS);
   try {
-    const st = await fetch("/api/status");
-    if (st.ok) applySnapshot(await st.json());
-  } catch {
-    /* ignore */
+    const st = await fetch("/api/status", { signal: ctrl.signal, cache: "no-store" });
+    if (!st.ok) return null;
+    return st.json();
+  } finally {
+    window.clearTimeout(timer);
   }
+}
+
+async function refreshStatusFromServer() {
+  if (statusPollInFlight) return;
+  statusPollInFlight = true;
+  try {
+    const snap = await fetchStatusSnapshot();
+    if (snap) {
+      statusPollFailStreak = 0;
+      if (typeof snap.status_poll_interval_ms === "number" && snap.status_poll_interval_ms > 0) {
+        window.__APP_POLL_MS__ = snap.status_poll_interval_ms;
+      }
+      applySnapshot(snap);
+    } else {
+      statusPollFailStreak += 1;
+      if (statusPollFailStreak >= 2) {
+        setBanner("Could not reach the app server — check that scripts/run.sh is still running.", true);
+      }
+    }
+  } catch {
+    statusPollFailStreak += 1;
+    if (statusPollFailStreak >= 2) {
+      setBanner("Status refresh failed — retrying automatically.", true);
+    }
+  } finally {
+    statusPollInFlight = false;
+    scheduleStatusPoll();
+  }
+}
+
+function scheduleStatusPoll() {
+  if (statusPollTimer) clearTimeout(statusPollTimer);
+  const delay = statusPollIntervalMs(lastSnapshot);
+  statusPollTimer = setTimeout(() => {
+    refreshStatusFromServer();
+  }, delay);
+}
+
+function startStatusPolling() {
+  if (statusPollTimer) clearTimeout(statusPollTimer);
+  refreshStatusFromServer();
+}
+
+function wireWorkflowReview(kind) {
+  const wf = workflowCfg(kind);
+  const dlg = document.getElementById(wf.dlgId);
+  const openPanel = async () => {
+    await openPagedReview(kind, { page: 0 });
+  };
+  const closePanel = () => {
+    if (dlg && dlg.open) dlg.close();
+    reviewPagerState[reviewPagerKey(kind)].dialogOpen = false;
+  };
+  document.getElementById(wf.btnOpenId)?.addEventListener("click", () => openPanel());
+  document.getElementById(wf.btnCloseId)?.addEventListener("click", () => closePanel());
+  document.getElementById(wf.btnCloseFooterId)?.addEventListener("click", () => closePanel());
+  document.getElementById(wf.pagerPrevId)?.addEventListener("click", () => gotoReviewPage(kind, -1));
+  document.getElementById(wf.pagerNextId)?.addEventListener("click", () => gotoReviewPage(kind, 1));
+  const sizeSlider = document.getElementById(wf.sizeSliderId);
+  sizeSlider?.addEventListener("input", () => {
+    const filterId = sizeFilterFromSliderIndex(sizeSlider.value);
+    const meta = sizeFilterMeta(filterId);
+    const valueEl = document.getElementById(wf.sizeValueId);
+    if (valueEl) valueEl.textContent = meta.label;
+    sizeSlider.setAttribute("aria-valuenow", String(sliderIndexFromSizeFilter(filterId)));
+  });
+  sizeSlider?.addEventListener("change", () => {
+    setReviewSizeFilter(kind, sizeFilterFromSliderIndex(sizeSlider.value));
+  });
+
+  const dlgDel = document.getElementById(wf.dlgDeleteId);
+  const delPagerPrefix = kind === "fuzzy" ? "Fuzzy" : "Exact";
+  document.getElementById(wf.btnDeleteId)?.addEventListener("click", async () => {
+    deletePreviewPager[kind === "fuzzy" ? "fuzzy" : "exact"].page = 0;
+    await loadDeletePreviewDialog(kind, 0);
+    if (dlgDel) dlgDel.showModal();
+  });
+  document.getElementById(`btnDelete${delPagerPrefix}PreviewPrev`)?.addEventListener("click", async () => {
+    const st = deletePreviewPager[kind === "fuzzy" ? "fuzzy" : "exact"];
+    if (st.page > 0) await loadDeletePreviewDialog(kind, st.page - 1);
+  });
+  document.getElementById(`btnDelete${delPagerPrefix}PreviewNext`)?.addEventListener("click", async () => {
+    const st = deletePreviewPager[kind === "fuzzy" ? "fuzzy" : "exact"];
+    const tp = st.total > 0 ? Math.ceil(st.total / previewPageSize) : 0;
+    if (st.page < tp - 1) await loadDeletePreviewDialog(kind, st.page + 1);
+  });
+  document.getElementById(wf.btnCancelDeleteId)?.addEventListener("click", () => dlgDel?.close());
+  document.getElementById(wf.btnConfirmDeleteId)?.addEventListener("click", async (e) => {
+    e.preventDefault();
+    scrollToLiveProgress();
+    const phrase = document.getElementById(wf.confirmInputId)?.value.trim() || "";
+    const sizeFilter = reviewPagerState[reviewPagerKey(kind)].sizeFilter || "all";
+    optimisticBusyPhase("deleting");
+    const res = await fetch(
+      `/api/delete?kind=${encodeURIComponent(wf.kind)}&${sizeFilterQueryParam(sizeFilter)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ paths: [], confirm: phrase }),
+      },
+    );
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) toast(`Delete blocked: ${j.detail || res.status}`);
+    else toast("Deleting — watch live progress at the top.");
+    dlgDel?.close();
+    const inp = document.getElementById(wf.confirmInputId);
+    if (inp) inp.value = "";
+    await refreshStatusFromServer();
+  });
 }
 
 function wireButtons() {
   wireStepJumps();
+  wireWorkflowReview("exact");
+  wireWorkflowReview("fuzzy");
+  document.getElementById("btnDocPreviewPrev")?.addEventListener("click", async () => {
+    if (docPreviewPager.page > 0) {
+      docPreviewPager.page -= 1;
+      const summaryEl = document.getElementById("docPreviewSummary");
+      const stripEl = document.getElementById("docPreviewStrip");
+      await fillDocPreviewInto(summaryEl, stripEl, {
+        scope: docPreviewPager.scope,
+        vf: docPreviewPager.vf,
+        page: docPreviewPager.page,
+        pagerUi: "panel",
+      });
+    }
+  });
+  document.getElementById("btnDocPreviewNext")?.addEventListener("click", async () => {
+    const tp = docPreviewPager.total > 0 ? Math.ceil(docPreviewPager.total / previewPageSize) : 0;
+    if (docPreviewPager.page < tp - 1) {
+      docPreviewPager.page += 1;
+      const summaryEl = document.getElementById("docPreviewSummary");
+      const stripEl = document.getElementById("docPreviewStrip");
+      await fillDocPreviewInto(summaryEl, stripEl, {
+        scope: docPreviewPager.scope,
+        vf: docPreviewPager.vf,
+        page: docPreviewPager.page,
+        pagerUi: "panel",
+      });
+    }
+  });
+  const docDlgPage = async (delta) => {
+    const tp = docPreviewPager.total > 0 ? Math.ceil(docPreviewPager.total / previewPageSize) : 0;
+    const next = docPreviewPager.page + delta;
+    if (next < 0 || next >= tp) return;
+    await loadDocRemoveDialogPreview(next);
+  };
+  document.getElementById("btnDocDlgPreviewPrev")?.addEventListener("click", () => docDlgPage(-1));
+  document.getElementById("btnDocDlgPreviewNext")?.addEventListener("click", () => docDlgPage(1));
 
   document.getElementById("btnActivityLogClear")?.addEventListener("click", async () => {
     scrollToLiveProgress();
@@ -724,6 +1628,7 @@ function wireButtons() {
   });
   document.getElementById("btnMount").addEventListener("click", async () => {
     scrollToLiveProgress();
+    optimisticBusyPhase("mounting");
     toast("Mount started — live updates appear at the top of the page.");
     const res = await fetch("/api/mount", { method: "POST" });
     const j = await res.json().catch(() => ({}));
@@ -738,6 +1643,7 @@ function wireButtons() {
   });
   document.getElementById("btnUnmount").addEventListener("click", async () => {
     scrollToLiveProgress();
+    optimisticBusyPhase("unmounting");
     toast("Unmounting — close Finder windows pointing at the mount first.");
     const res = await fetch("/api/unmount", { method: "POST" });
     const j = await res.json().catch(() => ({}));
@@ -747,6 +1653,7 @@ function wireButtons() {
   });
   async function postScanStart(kind) {
     scrollToLiveProgress();
+    optimisticBusyPhase("scanning", kind);
     const q = kind === "fuzzy" ? "?kind=fuzzy" : "?kind=exact";
     const res = await fetch(`/api/scan/start${q}`, { method: "POST" });
     const j = await res.json().catch(() => ({}));
@@ -758,10 +1665,12 @@ function wireButtons() {
     } else {
       toast(j.message || "Scan started — watch live progress at the top.");
     }
+    await refreshStatusFromServer();
   }
   document.getElementById("btnScan").addEventListener("click", () => postScanStart("exact"));
   document.getElementById("btnScanFuzzy")?.addEventListener("click", () => postScanStart("fuzzy"));
-  document.getElementById("btnScanCancel").addEventListener("click", async () => {
+  async function postScanCancel() {
+    scrollToLiveProgress();
     const res = await fetch("/api/scan/cancel", { method: "POST" });
     const j = await res.json().catch(() => ({}));
     if (!res.ok) {
@@ -770,39 +1679,10 @@ function wireButtons() {
     }
     if (j.noop) toast(j.message || "No scan was running.");
     else toast(j.message || "Stop requested.");
-  });
-  const dlgDup = document.getElementById("dlgDupReview");
-  const openDupPanel = () => {
-    if (dlgDup) dlgDup.showModal();
-  };
-  const closeDupPanel = () => {
-    if (dlgDup && dlgDup.open) dlgDup.close();
-  };
-  document.getElementById("btnDupReviewOpen")?.addEventListener("click", () => openDupPanel());
-  document.getElementById("btnDupReviewClose")?.addEventListener("click", () => closeDupPanel());
-  document.getElementById("btnDupReviewCloseFooter")?.addEventListener("click", () => closeDupPanel());
-
-  const dlg = document.getElementById("dlgDelete");
-  document.getElementById("btnDelete").addEventListener("click", async () => {
-    await loadDeletePreviewDialog();
-    dlg.showModal();
-  });
-  document.getElementById("btnCancelDelete").addEventListener("click", () => dlg.close());
-  document.getElementById("btnConfirmDelete").addEventListener("click", async (e) => {
-    e.preventDefault();
-    scrollToLiveProgress();
-    const phrase = document.getElementById("confirmInput").value.trim();
-    const res = await fetch("/api/delete", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ paths: [], confirm: phrase }),
-    });
-    const j = await res.json().catch(() => ({}));
-    if (!res.ok) toast(`Delete blocked: ${j.detail || res.status}`);
-    else toast("Deleting — watch live progress at the top.");
-    dlg.close();
-    document.getElementById("confirmInput").value = "";
-  });
+    await refreshStatusFromServer();
+  }
+  document.getElementById("btnScanCancelExact")?.addEventListener("click", () => postScanCancel());
+  document.getElementById("btnScanCancelFuzzy")?.addEventListener("click", () => postScanCancel());
 
   const dlgDoc = document.getElementById("dlgDocuments");
   const dlgFin = document.getElementById("dlgDocFinalize");
@@ -829,6 +1709,16 @@ function wireButtons() {
   document.getElementById("btnDocConfirm").addEventListener("click", async (e) => {
     e.preventDefault();
     scrollToLiveProgress();
+    mergeSnapshotPatch({
+      jobs: [
+        {
+          running: true,
+          kind: "document_remove",
+          label: "Removing document images…",
+          message: "Starting…",
+        },
+      ],
+    });
     const scopeEl = document.querySelector('input[name="docScope"]:checked');
     const scope = scopeEl ? scopeEl.value : "older_than_90d";
     const include_visual_fallback = document.getElementById("docVisualFallback").checked;
@@ -847,8 +1737,10 @@ function wireButtons() {
     }
     dlgDoc.close();
     document.getElementById("docConfirmInput").value = "";
+    await refreshStatusFromServer();
   });
   document.getElementById("btnDocUndo").addEventListener("click", async () => {
+    scrollToLiveProgress();
     const res = await fetch("/api/documents/undo", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -857,6 +1749,7 @@ function wireButtons() {
     const j = await res.json().catch(() => ({}));
     if (!res.ok) toast(`Undo failed: ${j.detail || res.status}`);
     else toast(`Restored ${(j.restored || []).length} file(s) to the phone.`);
+    await refreshStatusFromServer();
   });
 
   const finAll = document.getElementById("docFinalizeAll");
@@ -896,6 +1789,7 @@ function wireButtons() {
     if (!res.ok) toast(`Finalize failed: ${j.detail || res.status}`);
     else toast("Mac holding copies dropped.");
     dlgFin.close();
+    await refreshStatusFromServer();
   });
 }
 
@@ -904,9 +1798,24 @@ function startSse() {
   es.onmessage = async (ev) => {
     try {
       const s = JSON.parse(ev.data);
+      if (typeof s.status_poll_interval_ms === "number" && s.status_poll_interval_ms > 0) {
+        window.__APP_POLL_MS__ = s.status_poll_interval_ms;
+      }
       applySnapshot(s);
-      if (s.phase === "reviewing") {
-        await loadGroups();
+      markRefreshed(s);
+      const ex = typeof s.exact_group_count === "number" ? s.exact_group_count : 0;
+      const fz = typeof s.fuzzy_group_count === "number" ? s.fuzzy_group_count : 0;
+      if (ex !== lastLoadedGroupCounts.exact) {
+        lastLoadedGroupCounts.exact = ex;
+        if (ex > 0 && reviewPagerState.exact.dialogOpen) {
+          await loadReviewPage("exact", reviewPagerState.exact.page);
+        }
+      }
+      if (fz !== lastLoadedGroupCounts.fuzzy) {
+        lastLoadedGroupCounts.fuzzy = fz;
+        if (fz > 0 && reviewPagerState.fuzzy.dialogOpen) {
+          await loadReviewPage("fuzzy", reviewPagerState.fuzzy.page);
+        }
       }
     } catch {
       /* ignore */
@@ -918,16 +1827,32 @@ function startSse() {
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
+  uiBootstrapDone = true;
   wireButtons();
   startSse();
+  startStatusPolling();
   try {
-    await fetch("/api/device");
-    const st = await fetch("/api/status");
-    if (st.ok) {
-      applySnapshot(await st.json());
+    await fetch("/api/device", { cache: "no-store" });
+    const snap = await fetchStatusSnapshot();
+    if (snap) {
+      if (typeof snap.status_poll_interval_ms === "number" && snap.status_poll_interval_ms > 0) {
+        window.__APP_POLL_MS__ = snap.status_poll_interval_ms;
+      }
+      applySnapshot(snap);
+    } else {
+      const msg =
+        "Could not load session status — is scripts/run.sh still running? Start it from the repo root.";
+      setBanner(msg, true);
+      renderActivityHubMinimal(msg);
     }
   } catch {
-    /* ignore */
+    const msg = "Could not connect — start the app with scripts/run.sh, then reload this page.";
+    setBanner(msg, true);
+    renderActivityHubMinimal(msg);
   }
-  await loadGroups();
+  try {
+    await refreshAllScanSessions();
+  } catch {
+    /* scan session list is optional for the activity hub */
+  }
 });

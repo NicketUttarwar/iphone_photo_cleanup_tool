@@ -6,7 +6,6 @@ import asyncio
 import json
 import threading
 import time
-import uuid
 from pathlib import Path
 from typing import Any, Literal, Optional
 
@@ -15,9 +14,23 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from iphone_cleanup import auto_best, delete as delmod, device_bridge, documents, group_keep_util, mount, scan, thumbnails
+from iphone_cleanup import (
+    auto_best,
+    delete as delmod,
+    device_bridge,
+    documents,
+    group_keep_util,
+    group_size_filter,
+    mount,
+    scan,
+    scan_sessions,
+    thumbnails,
+)
 from iphone_cleanup.app_context import AppCtx
 from iphone_cleanup.app_log import log_event
+from iphone_cleanup.run_session import is_run_session_active
+from iphone_cleanup.runtime_session import persist_runtime, reconcile_busy_mount
+from iphone_cleanup.session_bootstrap import sync_device, sync_mount_from_disk
 from iphone_cleanup.state import Phase
 
 router = APIRouter()
@@ -31,12 +44,29 @@ def _ctx(request: Request) -> AppCtx:
 
 def _touch(ctx: AppCtx) -> None:
     ctx.state.next_event_seq()
+    persist_runtime(ctx)
+
+
+def _sync_runtime(ctx: AppCtx) -> None:
+    sync_device(ctx)
+    sync_mount_from_disk(ctx)
+    reconcile_busy_mount(ctx)
 
 
 def _enriched_snapshot(ctx: AppCtx) -> dict[str, Any]:
     snap = ctx.state.snapshot()
+    snap["run_session_id"] = ctx.run_session_id
+    snap["run_session_active"] = is_run_session_active(ctx)
     snap["document_batches"] = documents.list_batches(ctx.settings.data_dir)
     snap["fuzzy_roll_batch_size"] = ctx.settings.fuzzy_roll_batch_size
+    snap["groups_page_size"] = ctx.settings.groups_page_size
+    snap["preview_page_size"] = ctx.settings.preview_page_size
+    snap["images_per_group_page"] = ctx.settings.images_per_group_page
+    snap["review_thumbnail_max_edge"] = ctx.settings.review_thumbnail_max_edge
+    try:
+        snap["configured_mount_point"] = str(ctx.settings.mount_point.resolve())
+    except OSError:
+        snap["configured_mount_point"] = str(ctx.settings.mount_point)
     return snap
 
 
@@ -125,6 +155,10 @@ class DocumentBatchBody(BaseModel):
     batch_id: Optional[str] = None
 
 
+class ScanSessionActivateBody(BaseModel):
+    session_id: str
+
+
 @router.get("/", response_class=HTMLResponse)
 def index(request: Request) -> Any:
     ctx = _ctx(request)
@@ -150,8 +184,10 @@ def health() -> dict[str, str]:
 @router.get("/api/status")
 def api_status(request: Request) -> dict[str, Any]:
     ctx = _ctx(request)
+    _sync_runtime(ctx)
     snap = _enriched_snapshot(ctx)
     snap["keep_mode"] = ctx.effective_keep_mode()
+    snap["status_poll_interval_ms"] = ctx.settings.sse_poll_interval_ms
     return snap
 
 
@@ -167,16 +203,8 @@ def api_activity_log_clear(request: Request) -> dict[str, Any]:
 @router.get("/api/device")
 def api_device(request: Request) -> dict[str, Any]:
     ctx = _ctx(request)
-    dev = device_bridge.detect_device(ctx.settings.ideviceinfo, ctx.settings.idevice_id)
-    ctx.state.device_info = dev
-    if dev.get("trusted") and ctx.state.phase == Phase.idle:
-        ctx.state.set_phase(Phase.device_detected)
-    ctx.state.append_activity(
-        "DEVICE CHECK | "
-        f"trusted={dev.get('trusted')} | name={dev.get('name')!r} | udid={dev.get('udid')!r} | "
-        f"ios_version={dev.get('ios_version')!r} | error={dev.get('error')!r} | "
-        f"session_phase={ctx.state.phase.value}"
-    )
+    dev = sync_device(ctx, log_check=True)
+    sync_mount_from_disk(ctx)
     _touch(ctx)
     return dev
 
@@ -256,6 +284,7 @@ def api_unmount(request: Request) -> dict[str, Any]:
         ctx.state.mount_udid = None
         ctx.state.ifuse_proc = None
         ctx.state.duplicate_groups = []
+        ctx.state.library_indexed_count = None
         ctx.state.group_keep = {}
         ctx.state.scan_artifact_path = None
         ctx.state.fuzzy_roll_next_start = 0
@@ -293,9 +322,105 @@ def _relpath_if_under(full_path: str, mount_root: Path) -> str | None:
         return None
 
 
-def _duplicate_paths_to_delete(ctx: AppCtx) -> list[str]:
+def _thumbnail_roots(ctx: AppCtx) -> list[Path]:
+    """Mount directories used to resolve review thumbnails (live mount, config path, saved sessions)."""
+    roots: list[Path] = []
+    seen: set[str] = set()
+
+    def add(p: Path | None) -> None:
+        if p is None:
+            return
+        try:
+            r = p.resolve()
+        except OSError:
+            return
+        key = str(r)
+        if key in seen:
+            return
+        seen.add(key)
+        roots.append(r)
+
+    add(ctx.state.mount_path)
+    add(ctx.settings.mount_point)
+    us_root = ctx.settings.user_scans_dir
+    for sid in (
+        ctx.state.active_exact_scan_session_id,
+        ctx.state.active_fuzzy_scan_session_id,
+        ctx.state.active_scan_session_id,
+    ):
+        if not sid:
+            continue
+        try:
+            manifest, _, _, _ = scan_sessions.load_session_groups(us_root, sid)
+        except (OSError, ValueError, FileNotFoundError):
+            continue
+        mp = manifest.get("mount_path")
+        if mp:
+            add(Path(str(mp)))
+    return roots
+
+
+def _relpath_under_roots(full_path: str, roots: list[Path]) -> str:
+    try:
+        full = Path(full_path).resolve()
+    except OSError:
+        return ""
+    for root in roots:
+        try:
+            return str(full.relative_to(root.resolve()))
+        except ValueError:
+            continue
+    return ""
+
+
+def _resolve_thumbnail_file(ctx: AppCtx, relpath: str) -> tuple[Path, Path]:
+    if ".." in Path(relpath).parts:
+        raise HTTPException(400, "Invalid path.")
+    rel = relpath.replace("\\", "/").lstrip("/")
+    for root in _thumbnail_roots(ctx):
+        full = (root / rel).resolve()
+        try:
+            full.relative_to(root.resolve())
+        except ValueError:
+            continue
+        if full.is_file():
+            return full, root.resolve()
+    raise HTTPException(404, "Not found.")
+
+
+def _groups_for_kind(ctx: AppCtx, scan_kind: Literal["exact", "fuzzy"]) -> list[dict[str, Any]]:
+    return scan_sessions.filter_groups_by_kind(ctx.state.duplicate_groups, scan_kind)
+
+
+def _parse_size_filter(raw: str | None) -> group_size_filter.GroupSizeFilter:
+    try:
+        return group_size_filter.normalize_size_filter(raw)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+def _review_groups(
+    ctx: AppCtx,
+    scan_kind: Literal["exact", "fuzzy"],
+    size_filter: group_size_filter.GroupSizeFilter,
+) -> list[dict[str, Any]]:
+    kind_groups = _groups_for_kind(ctx, scan_kind)
+    return group_size_filter.filter_groups_by_size(kind_groups, size_filter)
+
+
+def _duplicate_paths_to_delete(
+    ctx: AppCtx,
+    scan_kind: Literal["exact", "fuzzy"] | None = None,
+    size_filter: group_size_filter.GroupSizeFilter = "all",
+) -> list[str]:
+    if scan_kind is not None:
+        groups = _review_groups(ctx, scan_kind, size_filter)
+    else:
+        groups = ctx.state.duplicate_groups
+        if size_filter != "all":
+            groups = group_size_filter.filter_groups_by_size(groups, size_filter)
     to_delete: list[str] = []
-    for g in ctx.state.duplicate_groups:
+    for g in groups:
         keep_set = group_keep_util.keep_paths_set(ctx, g)
         for p in g.get("paths") or []:
             if str(p) not in keep_set:
@@ -360,6 +485,8 @@ def _maybe_start_pending_rescan(ctx: AppCtx) -> None:
     with ctx.state.lock:
         ctx.state.scan_cancel_requested = False
     ctx.state.set_phase(Phase.scanning)
+    with ctx.state.lock:
+        ctx.state.scan_running_kind = pending
     log_event("scan_start_chained", scan_kind=pending)
     t = threading.Thread(target=_run_scan_thread, args=(ctx, pending, False), daemon=True)
     t.start()
@@ -409,10 +536,12 @@ def _run_scan_thread(
     fuzzy_restart: bool = False,
 ) -> None:
     job_label = (
-        "Fuzzy roll batch (similar adjacent shots)…"
+        "Fuzzy roll batch (bursts & same-scene sets)…"
         if scan_kind == "fuzzy"
         else "Scanning library for duplicates…"
     )
+    with ctx.state.lock:
+        ctx.state.scan_running_kind = scan_kind
     job = ctx.state.start_job("scan", job_label)
     try:
         root = ctx.state.mount_path
@@ -433,14 +562,23 @@ def _run_scan_thread(
             f"mount_root={root.resolve()} | fuzzy_roll_next_start={fz_next_snap} | "
             f"fuzzy_roll_batch_size={ctx.settings.fuzzy_roll_batch_size} | mount_udid={ctx.state.mount_udid!r} | "
             f"exact_phash_threshold={ctx.settings.phash_threshold} | fuzzy_adjacent_hamming_max="
-            f"{ctx.settings.fuzzy_phash_max_hamming} | fuzzy_phash_max_dim={ctx.settings.fuzzy_phash_max_dim}"
+            f"{ctx.settings.fuzzy_phash_max_hamming} | fuzzy_phash_max_dim={ctx.settings.fuzzy_phash_max_dim} | "
+            f"fuzzy_palette_grid={ctx.settings.fuzzy_palette_grid} | scipy_palette_emd="
+            f"{scan.fuzzy_palette_scipy_status()}"
         )
+
+        last_prog_touch = 0.0
 
         def prog(cur: int, total: int, msg: str) -> None:
             if total > 0:
                 ctx.state.update_job(job.job_id, msg, progress_current=cur, progress_total=total)
             else:
                 ctx.state.update_job(job.job_id, msg, progress_current=None, progress_total=None)
+            nonlocal last_prog_touch
+            now = time.time()
+            if now - last_prog_touch >= 1.5:
+                last_prog_touch = now
+                _touch(ctx)
 
         try:
             if scan_kind == "fuzzy":
@@ -458,16 +596,25 @@ def _run_scan_thread(
                     batch_size=ctx.settings.fuzzy_roll_batch_size,
                     phash_max_dim=ctx.settings.fuzzy_phash_max_dim,
                     max_adjacent_hamming=ctx.settings.fuzzy_phash_max_hamming,
+                    fuzzy_match_config=scan.fuzzy_match_config_from_settings(ctx.settings),
+                    fuzzy_roll_sort_exif=ctx.settings.fuzzy_roll_sort_exif,
                     progress_callback=prog,
                     cancel_event=ctx.state.scan_cancel_event,
                 )
+                with ctx.state.lock:
+                    ctx.state.library_indexed_count = fuzzy_total
             else:
-                groups = scan.scan_duplicates(
+                groups, indexed = scan.scan_duplicates(
                     root,
                     ctx.settings.phash_threshold,
+                    phash_max_dim=ctx.settings.fuzzy_phash_max_dim,
+                    exact_max_hash_cluster=ctx.settings.exact_max_hash_cluster,
                     progress_callback=prog,
                     cancel_event=ctx.state.scan_cancel_event,
+                    walk_progress_every=ctx.settings.walk_progress_every,
                 )
+                with ctx.state.lock:
+                    ctx.state.library_indexed_count = indexed
         except scan.ScanCancelled as e:
             if scan_kind == "fuzzy":
                 groups = scan.finalize_groups(e.partial_groups, scan_kind="fuzzy")
@@ -477,7 +624,9 @@ def _run_scan_thread(
         except Exception as e:
             ctx.state.last_error = str(e)
             ctx.state.finish_job(job.job_id, str(e))
-            ctx.state.set_phase(Phase.mounted)
+            ctx.state.set_phase(
+                Phase.reviewing if ctx.state.duplicate_groups else Phase.mounted
+            )
             _touch(ctx)
             log_event("scan_error", job_id=job.job_id, error=str(e))
             return
@@ -496,11 +645,21 @@ def _run_scan_thread(
             with ctx.state.lock:
                 ctx.state.fuzzy_roll_next_start = 0
                 ctx.state.fuzzy_roll_total = None
-            ctx.state.duplicate_groups = groups
-            ctx.state.group_keep = {}
+                fuzzy_kept = scan_sessions.filter_groups_by_kind(ctx.state.duplicate_groups, "fuzzy")
+                old_exact_ids = {
+                    str(g["id"])
+                    for g in ctx.state.duplicate_groups
+                    if scan_sessions.group_scan_kind(g) == "exact"
+                }
+                ctx.state.duplicate_groups = fuzzy_kept + groups
+                for gid in old_exact_ids:
+                    ctx.state.group_keep.pop(gid, None)
             _apply_auto_groups(ctx)
         else:
-            ctx.state.duplicate_groups = list(ctx.state.duplicate_groups) + groups
+            with ctx.state.lock:
+                exact_kept = scan_sessions.filter_groups_by_kind(ctx.state.duplicate_groups, "exact")
+                fuzzy_kept = scan_sessions.filter_groups_by_kind(ctx.state.duplicate_groups, "fuzzy")
+                ctx.state.duplicate_groups = exact_kept + fuzzy_kept + groups
             for g in groups:
                 gid = str(g["id"])
                 paths = list(g.get("paths") or [])
@@ -510,9 +669,33 @@ def _run_scan_thread(
                 g["recommendedKeeps"] = list(kps)
                 g["recommendedKeep"] = kps[0]
                 ctx.state.group_keep[gid] = list(kps)
-        art = ctx.settings.scan_artifacts_dir / f"scan_{int(time.time())}_{uuid.uuid4().hex[:8]}.json"
-        scan.write_artifact(art, groups, scan_kind="fuzzy" if scan_kind == "fuzzy" else None)
-        ctx.state.scan_artifact_path = art
+        with ctx.state.lock:
+            groups_to_save = scan_sessions.filter_groups_by_kind(
+                list(ctx.state.duplicate_groups), scan_kind
+            )
+        save_ids = {str(g["id"]) for g in groups_to_save}
+        gk_save = {
+            gid: list(paths) for gid, paths in ctx.state.group_keep.items() if gid in save_ids
+        }
+        manifest = scan_sessions.persist_session(
+            ctx.settings.user_scans_dir,
+            groups=groups_to_save,
+            scan_kind=scan_kind,
+            mount_udid=ctx.state.mount_udid,
+            mount_path=ctx.state.mount_path,
+            group_keep=gk_save,
+        )
+        ctx.state.scan_artifact_path = Path(str(manifest["results_path"]))
+        sid = str(manifest["id"])
+        ctx.state.active_scan_session_id = sid
+        with ctx.state.lock:
+            if scan_kind == "exact":
+                ctx.state.active_exact_scan_session_id = sid
+            else:
+                ctx.state.active_fuzzy_scan_session_id = sid
+        ctx.state.append_activity(
+            f"SCAN SESSION | saved {manifest['id']!r} ({manifest.get('group_count', 0)} groups) under user_scans/"
+        )
         if cancelled and len(groups) == 0:
             if scan_kind == "fuzzy" and had_any_groups_prior:
                 ctx.state.set_phase(Phase.reviewing)
@@ -536,9 +719,9 @@ def _run_scan_thread(
                         done_msg = "Fuzzy: no images found under the mount."
                     elif not groups and fuzzy_next >= fuzzy_total:
                         done_msg = (
-                            "Fuzzy: no burst groups in this slice; the roll is fully scanned for batches. "
-                            "POST /api/scan/start?kind=fuzzy&fuzzy_restart=true clears fuzzy groups and "
-                            "restarts from the top while reusing cached pHashes."
+                            "Fuzzy: no burst groups in this slice; the roll is fully scanned. "
+                            "Run Fuzzy roll scan again to clear fuzzy groups and rescan "
+                            "(reuses cached hashes on this Mac)."
                         )
                     elif not groups:
                         done_msg = (
@@ -559,6 +742,7 @@ def _run_scan_thread(
     finally:
         with ctx.state.lock:
             ctx.state.scan_cancel_requested = False
+            ctx.state.scan_running_kind = None
         _maybe_start_pending_rescan(ctx)
 
 
@@ -578,6 +762,7 @@ def api_scan_start(
     if ctx.state.phase == Phase.scanning:
         with ctx.state.lock:
             ctx.state.pending_rescan_kind = kind
+            ctx.state.scan_running_kind = kind
         ctx.state.scan_cancel_event.set()
         with ctx.state.lock:
             ctx.state.scan_cancel_requested = True
@@ -597,12 +782,21 @@ def api_scan_start(
         raise HTTPException(400, "Wait for mounting to finish before scanning.")
     if ctx.state.phase not in (Phase.mounted, Phase.reviewing):
         raise HTTPException(400, "Mount the device before scanning.")
+    if kind == "fuzzy" and not fuzzy_restart:
+        with ctx.state.lock:
+            fz_total = ctx.state.fuzzy_roll_total
+            fz_next = ctx.state.fuzzy_roll_next_start
+        if fz_total is not None and fz_total > 0 and fz_next >= fz_total:
+            fuzzy_restart = True
     ctx.state.scan_cancel_event.clear()
     with ctx.state.lock:
         ctx.state.scan_cancel_requested = False
         ctx.state.pending_rescan_kind = None
     phase_before = ctx.state.phase.value
-    ctx.state.set_phase(Phase.scanning)
+    scan_detail = "exact duplicate scan" if kind == "exact" else "fuzzy roll batch"
+    ctx.state.set_phase(Phase.scanning, detail=scan_detail)
+    with ctx.state.lock:
+        ctx.state.scan_running_kind = kind
     log_event("scan_start", scan_kind=kind)
     ctx.state.append_activity(
         f"SCAN START | kind={kind!r} | fuzzy_restart={fuzzy_restart} | phase_before={phase_before} | phase_now=scanning | "
@@ -611,11 +805,15 @@ def api_scan_start(
     t = threading.Thread(target=_run_scan_thread, args=(ctx, kind, fuzzy_restart), daemon=True)
     t.start()
     _touch(ctx)
-    msg = (
-        "Fuzzy roll batch started — only the next slice of the library is hashed; progress is at the top."
-        if kind == "fuzzy"
-        else "Exact duplicate scan started — watch live progress at the top of the page."
-    )
+    if kind == "fuzzy":
+        if ctx.settings.fuzzy_roll_batch_size <= 0:
+            msg = "Fuzzy roll scan started — indexing and hashing the entire library; progress is at the top."
+        else:
+            msg = (
+                "Fuzzy roll batch started — only the next slice of the library is hashed; progress is at the top."
+            )
+    else:
+        msg = "Exact duplicate scan started — walking every photo on the mount; progress is at the top of the page."
     return {"ok": True, "message": msg, "scan_kind": kind}
 
 
@@ -641,10 +839,129 @@ def api_scan_cancel(request: Request) -> dict[str, Any]:
     }
 
 
-@router.get("/api/scan/groups")
-def api_scan_groups(request: Request) -> dict[str, Any]:
+@router.get("/api/scan/sessions")
+def api_scan_sessions(
+    request: Request,
+    kind: Optional[Literal["exact", "fuzzy"]] = Query(
+        None,
+        description='Filter saved scans to "exact" or "fuzzy". Omit to return all.',
+    ),
+) -> dict[str, Any]:
     ctx = _ctx(request)
-    return {"groups": ctx.state.duplicate_groups, "keep": ctx.state.group_keep, "keep_mode": ctx.effective_keep_mode()}
+    root = ctx.settings.user_scans_dir
+    sessions = scan_sessions.list_sessions(root)
+    if kind is not None:
+        sk = scan_sessions._normalize_scan_kind(kind)
+        sessions = [
+            s
+            for s in sessions
+            if scan_sessions._normalize_scan_kind(str(s.get("scan_kind") or "exact")) == sk
+        ]
+        active = (
+            (
+                ctx.state.active_exact_scan_session_id
+                if sk == "exact"
+                else ctx.state.active_fuzzy_scan_session_id
+            )
+            or scan_sessions.default_active_id(root, sk)
+        )
+    else:
+        active = ctx.state.active_scan_session_id or scan_sessions.default_active_id(root)
+    return {
+        "sessions": sessions,
+        "active_session_id": active,
+        "scan_kind": kind,
+    }
+
+
+@router.post("/api/scan/sessions/activate")
+def api_scan_sessions_activate(body: ScanSessionActivateBody, request: Request) -> dict[str, Any]:
+    ctx = _ctx(request)
+    if ctx.state.phase == Phase.scanning:
+        raise HTTPException(409, "Wait for the current scan to finish before switching sessions.")
+    try:
+        manifest = scan_sessions.apply_session_to_state(ctx, body.session_id.strip())
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e)) from e
+    except OSError as e:
+        raise HTTPException(500, f"Could not load scan session: {e}") from e
+    ctx.state.append_activity(
+        f"SCAN SESSION | activated {manifest['id']!r} ({manifest.get('group_count', 0)} groups)"
+    )
+    _touch(ctx)
+    sk = scan_sessions._normalize_scan_kind(str(manifest.get("scan_kind") or "exact"))
+    kind_count = len(scan_sessions.filter_groups_by_kind(ctx.state.duplicate_groups, sk))
+    return {
+        "ok": True,
+        "session": manifest,
+        "group_count": len(ctx.state.duplicate_groups),
+        "kind_group_count": kind_count,
+        "scan_kind": sk,
+        "exact_group_count": sum(
+            1 for g in ctx.state.duplicate_groups if scan_sessions.group_scan_kind(g) == "exact"
+        ),
+        "fuzzy_group_count": sum(
+            1 for g in ctx.state.duplicate_groups if scan_sessions.group_scan_kind(g) == "fuzzy"
+        ),
+        "phase": ctx.state.phase.value,
+    }
+
+
+@router.get("/api/scan/groups")
+def api_scan_groups(
+    request: Request,
+    kind: Optional[Literal["exact", "fuzzy"]] = Query(
+        None,
+        description='Return only groups from the "exact" or "fuzzy" workflow.',
+    ),
+    offset: int = Query(0, ge=0),
+    limit: Optional[int] = Query(
+        None,
+        ge=1,
+        le=500,
+        description="Page size; defaults to ui.groups_page_size from config.",
+    ),
+    size_filter: str = Query(
+        "all",
+        description='Show only sets with this many photos: "all", "2", "3", "4", or "5plus" (5+).',
+    ),
+) -> dict[str, Any]:
+    ctx = _ctx(request)
+    sf = _parse_size_filter(size_filter)
+    if kind is not None:
+        kind_groups = _groups_for_kind(ctx, kind)
+        all_groups = group_size_filter.filter_groups_by_size(kind_groups, sf)
+        size_counts = group_size_filter.size_filter_counts(kind_groups)
+    else:
+        all_groups = group_size_filter.filter_groups_by_size(ctx.state.duplicate_groups, sf)
+        size_counts = group_size_filter.size_filter_counts(ctx.state.duplicate_groups)
+    page_size = limit if limit is not None else ctx.settings.groups_page_size
+    page_size = max(1, min(500, page_size))
+    total = len(all_groups)
+    page = all_groups[offset : offset + page_size]
+    page_ids = {str(g.get("id")) for g in page}
+    keep = {gid: paths for gid, paths in ctx.state.group_keep.items() if gid in page_ids}
+    thumb_roots = _thumbnail_roots(ctx)
+    groups_out: list[dict[str, Any]] = []
+    for g in page:
+        paths = [str(x) for x in g.get("paths") or []]
+        row = dict(g)
+        row["relpaths"] = [_relpath_under_roots(p, thumb_roots) for p in paths]
+        groups_out.append(row)
+    return {
+        "groups": groups_out,
+        "keep": keep,
+        "keep_mode": ctx.effective_keep_mode(),
+        "scan_kind": kind,
+        "size_filter": sf,
+        "size_counts": size_counts,
+        "total": total,
+        "offset": offset,
+        "limit": page_size,
+        "has_more": offset + len(page) < total,
+    }
 
 
 @router.post("/api/selection")
@@ -697,18 +1014,36 @@ def api_selection(body: SelectionBody, request: Request) -> dict[str, Any]:
         break
     if not found:
         raise HTTPException(404, "Unknown group.")
+    for g in ctx.state.duplicate_groups:
+        if str(g.get("id")) == gid:
+            sk = scan_sessions.group_scan_kind(g)
+            scan_sessions.sync_active_session_from_state(ctx, sk)
+            break
     _touch(ctx)
     return {"ok": True}
 
 
 @router.get("/api/delete/preview")
-def api_delete_preview(request: Request) -> dict[str, Any]:
+def api_delete_preview(
+    request: Request,
+    kind: Literal["exact", "fuzzy"] = Query(
+        "exact",
+        description='Preview deletions for the "exact" or "fuzzy" workflow only.',
+    ),
+    offset: int = Query(0, ge=0),
+    limit: Optional[int] = Query(None, ge=1, le=500),
+    size_filter: str = Query(
+        "all",
+        description='Preview deletions only for sets matching "all", "2", "3", "4", or "5plus".',
+    ),
+) -> dict[str, Any]:
     ctx = _ctx(request)
     root = ctx.state.mount_path
     if not root or not root.is_dir():
         raise HTTPException(400, "Mount the device first.")
+    sf = _parse_size_filter(size_filter)
     mroot = root.resolve()
-    to_delete = _duplicate_paths_to_delete(ctx)
+    to_delete = _duplicate_paths_to_delete(ctx, kind, sf)
     total_bytes = 0
     for raw in to_delete:
         try:
@@ -716,53 +1051,80 @@ def api_delete_preview(request: Request) -> dict[str, Any]:
         except OSError:
             continue
     groups_with_deletions = 0
-    thumbnail_samples: list[dict[str, str]] = []
-    max_thumbs = 40
-    for g in ctx.state.duplicate_groups:
+    all_samples: list[dict[str, str]] = []
+    review_groups = _review_groups(ctx, kind, sf)
+    for g in review_groups:
         gid = str(g.get("id"))
         keep_set = group_keep_util.keep_paths_set(ctx, g)
         paths = [str(x) for x in g.get("paths") or []]
         has_del = any(p not in keep_set for p in paths)
         if has_del:
             groups_with_deletions += 1
-        if len(thumbnail_samples) >= max_thumbs:
-            continue
         for p in paths:
             if p in keep_set:
                 continue
             rel = _relpath_if_under(str(p), mroot)
             if rel:
-                thumbnail_samples.append({"group_id": gid, "relpath": rel})
+                all_samples.append({"group_id": gid, "relpath": rel})
             break
+    page_size = limit if limit is not None else ctx.settings.preview_page_size
+    page_size = max(1, min(500, page_size))
+    total_samples = len(all_samples)
+    page = all_samples[offset : offset + page_size]
     return {
         "file_count": len(to_delete),
         "total_bytes": total_bytes,
-        "duplicate_group_count": len(ctx.state.duplicate_groups),
+        "duplicate_group_count": len(review_groups),
         "groups_with_deletions": groups_with_deletions,
-        "thumbnail_samples": thumbnail_samples,
+        "thumbnail_samples": page,
+        "thumbnail_sample_total": total_samples,
+        "offset": offset,
+        "limit": page_size,
+        "has_more": offset + len(page) < total_samples,
+        "scan_kind": kind,
+        "size_filter": sf,
+        "size_filter_label": group_size_filter.size_filter_label(sf),
     }
 
 
 @router.post("/api/delete")
-def api_delete(body: DeleteBody, request: Request) -> dict[str, Any]:
+def api_delete(
+    body: DeleteBody,
+    request: Request,
+    kind: Literal["exact", "fuzzy"] = Query(
+        "exact",
+        description='Delete only non-kept files from the "exact" or "fuzzy" workflow.',
+    ),
+    size_filter: str = Query(
+        "all",
+        description='Delete only within sets matching "all", "2", "3", "4", or "5plus".',
+    ),
+) -> dict[str, Any]:
     ctx = _ctx(request)
     if body.confirm != "DELETE_SELECTED_FILES":
         raise HTTPException(400, "Confirmation phrase mismatch.")
     root = ctx.state.mount_path
     if not root:
         raise HTTPException(400, "Not mounted.")
-    job = ctx.state.start_job("delete", "Deleting selected duplicates…")
-    log_event("delete_job_started", job_id=job.job_id)
+    sf = _parse_size_filter(size_filter)
+    sf_label = group_size_filter.size_filter_label(sf)
+    label = (
+        f"Deleting fuzzy burst extras ({sf_label})…"
+        if kind == "fuzzy"
+        else f"Deleting exact duplicate extras ({sf_label})…"
+    )
+    job = ctx.state.start_job("delete", label)
+    log_event("delete_job_started", job_id=job.job_id, size_filter=sf)
     ctx.state.set_phase(Phase.deleting)
 
     def work() -> None:
         try:
-            to_delete = _duplicate_paths_to_delete(ctx)
+            to_delete = _duplicate_paths_to_delete(ctx, kind, sf)
             extra = [p for p in body.paths if p not in to_delete]
             preview = to_delete[:8]
             ctx.state.append_activity(
-                f"DELETE JOB | paths_to_delete={len(to_delete)} | chunk_size={ctx.settings.delete_chunk_size} | "
-                f"first_paths_preview={preview!r}"
+                f"DELETE JOB | scan_kind={kind!r} | size_filter={sf!r} | paths_to_delete={len(to_delete)} | "
+                f"chunk_size={ctx.settings.delete_chunk_size} | first_paths_preview={preview!r}"
             )
             if extra:
                 ctx.state.update_job(job.job_id, "Extra paths ignored (not in duplicate-to-delete set).")
@@ -789,6 +1151,8 @@ def api_delete(body: DeleteBody, request: Request) -> dict[str, Any]:
                 on_progress=prog,
             )
             ctx.state.last_delete_ledger = {
+                "size_filter": sf,
+                "size_filter_label": sf_label,
                 "deleted_count": len(res["deleted"]),
                 "failed_count": len(res["failed"]),
                 "skipped_count": len(res["skipped"]),
@@ -898,6 +1262,8 @@ def api_documents_preview(
     request: Request,
     scope: Literal["all", "older_than_90d"] = "older_than_90d",
     include_visual_fallback: bool = False,
+    offset: int = Query(0, ge=0),
+    limit: Optional[int] = Query(None, ge=1, le=500),
 ) -> dict[str, Any]:
     ctx = _ctx(request)
     root = ctx.state.mount_path
@@ -915,20 +1281,25 @@ def api_documents_preview(
             total_bytes += p.stat().st_size
         except OSError:
             continue
-    sample = [str(p) for p in paths[:12]]
-    thumb_cap = 24
-    thumbnail_sample_relpaths: list[str] = []
+    page_size = limit if limit is not None else ctx.settings.preview_page_size
+    page_size = max(1, min(500, page_size))
+    thumb_relpaths: list[str] = []
     for p in paths:
-        if len(thumbnail_sample_relpaths) >= thumb_cap:
-            break
         rel = _relpath_if_under(str(p.resolve()), mroot)
         if rel:
-            thumbnail_sample_relpaths.append(rel)
+            thumb_relpaths.append(rel)
+    total_thumbs = len(thumb_relpaths)
+    page_thumbs = thumb_relpaths[offset : offset + page_size]
+    sample = [str(p) for p in paths[:12]]
     return {
         "count": len(paths),
         "total_bytes": total_bytes,
         "sample": sample,
-        "thumbnail_sample_relpaths": thumbnail_sample_relpaths,
+        "thumbnail_sample_relpaths": page_thumbs,
+        "thumbnail_sample_total": total_thumbs,
+        "offset": offset,
+        "limit": page_size,
+        "has_more": offset + len(page_thumbs) < total_thumbs,
         "scope": scope,
         "include_visual_fallback": include_visual_fallback,
     }
@@ -1062,31 +1433,20 @@ def api_thumbnail(
     max_edge: Optional[int] = Query(
         None,
         ge=64,
-        le=768,
+        le=2048,
         description="Optional longer edge for thumbnails (duplicate review uses a larger value).",
     ),
 ) -> Any:
     from fastapi.responses import Response
 
     ctx = _ctx(request)
-    root = ctx.state.mount_path
-    if not root:
-        raise HTTPException(400, "Not mounted.")
-    if ".." in Path(relpath).parts:
-        raise HTTPException(400, "Invalid path.")
-    full = (root / relpath).resolve()
-    try:
-        full.relative_to(root.resolve())
-    except ValueError:
-        raise HTTPException(400, "Outside mount.")
-    if not full.is_file():
-        raise HTTPException(404, "Not found.")
+    full, root = _resolve_thumbnail_file(ctx, relpath)
     edge = int(max_edge) if max_edge is not None else ctx.settings.thumbnail_max_edge
     ctx.thumb_semaphore.acquire()
     try:
         data = thumbnails.get_thumbnail_jpeg(
             full,
-            root.resolve(),
+            root,
             ctx.settings.thumbnail_cache_dir,
             edge,
             ctx.settings.thumbnail_jpeg_quality,
@@ -1104,6 +1464,7 @@ async def api_events(request: Request) -> StreamingResponse:
             if await request.is_disconnected():
                 break
             ctx = _ctx(request)
+            _sync_runtime(ctx)
             payload = _enriched_snapshot(ctx)
             payload["keep_mode"] = ctx.effective_keep_mode()
             yield f"data: {json.dumps(payload)}\n\n"

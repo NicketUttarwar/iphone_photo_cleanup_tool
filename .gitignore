@@ -8,3 +8,7 @@ config/app.local.yaml
 config/secrets.local.yaml
 data/
 tmp/
+user_scans/*
+!user_scans/README.md
+!user_scans/examples/
+!user_scans/examples/**

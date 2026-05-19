@@ -9,6 +9,7 @@ paths:
   logs_dir: "data/logs"
   thumbnail_cache_dir: "data/thumbnail_cache"
   scan_artifacts_dir: "data/scans"
+  user_scans_dir: "user_scans"
   mount_point: "data/iphone_mount"
 
 deletes:
@@ -25,13 +26,27 @@ ui:
   thumbnail_jpeg_quality: 75
   thumbnail_cache_max_mb: 1024
   max_concurrent_thumbnails: 3
-  sse_poll_interval_ms: 800
+  sse_poll_interval_ms: 5000
+  groups_page_size: 30
+  preview_page_size: 24
+  images_per_group_page: 12
+  review_thumbnail_max_edge: 1024
+  walk_progress_every: 250
 
 duplicates:
   auto_best:
     face_eye: false
     face_eye_max_images_per_group: 6
   phash_threshold: 6
+  fuzzy_phash_max_hamming: 12
+  fuzzy_phash_max_dim: 128
+  fuzzy_colorhash_max_hamming: 10
+  fuzzy_max_adjacent_gap_sec: 120
+  fuzzy_palette_grid: 16
+  fuzzy_grid_exact_match_min: 200
+  fuzzy_roll_batch_size: 0
+  fuzzy_roll_sort: fast
+  exact_max_hash_cluster: 0
 
 logging:
   level: "INFO"

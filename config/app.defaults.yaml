@@ -10,6 +10,7 @@ paths:
   logs_dir: "data/logs"
   thumbnail_cache_dir: "data/thumbnail_cache"
   scan_artifacts_dir: "data/scans"
+  user_scans_dir: "user_scans"
   mount_point: "data/iphone_mount"
 
 deletes:
@@ -28,7 +29,17 @@ ui:
   thumbnail_jpeg_quality: 72
   thumbnail_cache_max_mb: 512
   max_concurrent_thumbnails: 3
-  sse_poll_interval_ms: 800
+  sse_poll_interval_ms: 5000
+  # Duplicate review loads this many groups per page (large libraries may have thousands of groups).
+  groups_page_size: 30
+  # Thumbnails per page in document/delete confirmation dialogs.
+  preview_page_size: 24
+  # Photos shown at once inside one duplicate group (sub-pages when group is larger).
+  images_per_group_page: 12
+  # Thumbnails in the review overlay (larger = easier comparison; still capped per request).
+  review_thumbnail_max_edge: 1024
+  # How often to log walk progress while listing images from the phone.
+  walk_progress_every: 250
 
 duplicates:
   auto_best:
@@ -36,11 +47,25 @@ duplicates:
     # Only the first N files in each group run the heavier face/eye path (when face_eye is true).
     face_eye_max_images_per_group: 6
   phash_threshold: 6
-  # Fuzzy (roll-order burst) scan: adjacent photos in capture-time order with pHash distance <= this are grouped.
+  # Fuzzy roll: adjacent photos in capture-time order (bursts + same-scene palette/layout).
   fuzzy_phash_max_hamming: 12
   fuzzy_phash_max_dim: 128
-  # Fuzzy runs in roll-order slices of this many photos per click; pHashes are cached on disk between batches.
-  fuzzy_roll_batch_size: 1000
+  fuzzy_colorhash_max_hamming: 10
+  fuzzy_max_adjacent_gap_sec: 120
+  fuzzy_palette_enabled: true
+  fuzzy_palette_max_distance: 0.32
+  fuzzy_palette_max_color_count_delta: 4
+  fuzzy_palette_min_grid_agreement: 0.55
+  fuzzy_palette_grid: 16
+  fuzzy_fast_path_enabled: true
+  fuzzy_grid_exact_match_min: 200
+  fuzzy_opencv_palette: false
+  # Fuzzy: 0 = hash and analyze the entire library in one run (recommended). Positive = photos per click.
+  fuzzy_roll_batch_size: 0
+  # "fast" = file date + path (recommended for 10k+ libraries). "exif" = read capture time from every file (slow first run).
+  fuzzy_roll_sort: fast
+  # Exact duplicate compare chunk size within a size bucket; 0 = no chunking (full pairwise per bucket).
+  exact_max_hash_cluster: 0
 
 logging:
   level: "INFO"

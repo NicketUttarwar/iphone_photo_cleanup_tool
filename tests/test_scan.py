@@ -10,6 +10,7 @@ import pytest
 from PIL import Image
 
 from iphone_cleanup import scan
+from iphone_cleanup.fuzzy_palette import extract_fuzzy_features_from_path
 
 
 def _make_dup_pair(dir_path: Path) -> None:
@@ -37,7 +38,7 @@ def test_finalize_duplicate_groups_sizes(tmp_path: Path):
 def test_scan_duplicates_finds_visual_dupes(tmp_path: Path):
     d = tmp_path / "lib"
     _make_dup_pair(d)
-    groups = scan.scan_duplicates(d, phash_threshold=6)
+    groups, _n = scan.scan_duplicates(d, phash_threshold=6)
     assert len(groups) == 1
     assert len(groups[0]["paths"]) == 2
     assert groups[0].get("scan_kind") == "exact"
@@ -67,7 +68,7 @@ def test_scan_cancelled_immediately(tmp_path: Path):
     ev = threading.Event()
     ev.set()
     with pytest.raises(scan.ScanCancelled) as ei:
-        scan.scan_duplicates(d, phash_threshold=6, cancel_event=ev)
+        scan.scan_duplicates(d, phash_threshold=6, cancel_event=ev)  # noqa: B018
     assert isinstance(ei.value.partial_groups, list)
 
 
@@ -91,6 +92,33 @@ def test_write_artifact_empty_with_scan_kind(tmp_path: Path):
     data = json.loads(p.read_text(encoding="utf-8"))
     assert data["scan_kind"] == "fuzzy"
     assert data["groups"] == []
+
+
+def test_fuzzy_burst_starts_in_window_matches_full_scan(tmp_path: Path):
+    """Batch-local burst detection should match full-roll detection for chain starts in-window."""
+    d = tmp_path / "roll"
+    d.mkdir()
+    img = Image.new("RGB", (40, 30), color=(100, 140, 200))
+    paths = []
+    for name in ("a.jpg", "b.jpg", "c.jpg", "d.jpg"):
+        p = d / name
+        img.save(p, "JPEG", quality=93)
+        paths.append(p)
+    cfg = scan._default_fuzzy_match_config(96, 14)
+    features = [
+        extract_fuzzy_features_from_path(
+            p, max_dim=96, grid_side=cfg.grid_side, capture_ts=float(i)
+        )
+        for i, p in enumerate(paths)
+    ]
+    n = len(features)
+
+    def noop() -> None:
+        pass
+
+    full = scan._fuzzy_burst_index_ranges(n, features, cfg, noop)
+    local = scan._fuzzy_burst_starts_in_window(n, features, cfg, noop, 0, n)
+    assert [(a, b) for a, b, _ in local] == [(a, b) for a, b, _ in full]
 
 
 def test_fuzzy_roll_batch_advances_and_caches(tmp_path: Path):
@@ -214,5 +242,6 @@ def test_fuzzy_roll_batch_invalidates_old_cache_version(tmp_path: Path):
     assert total == 2
     assert next_idx == 2
     loaded = json.loads(cache_path.read_text(encoding="utf-8"))
-    assert loaded.get("version") == 2
+    assert loaded.get("version") == scan.FUZZY_CACHE_VERSION
     assert isinstance(g, list)
+    assert "palette_sigs" in loaded

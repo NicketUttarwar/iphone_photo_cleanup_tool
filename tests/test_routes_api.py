@@ -286,6 +286,52 @@ def test_selection_two_actions_rejected(test_client, app_ctx):
     assert r.status_code == 400
 
 
+def test_scan_groups_and_delete_scoped_by_size_filter(test_client, app_ctx, settings):
+    mount_root = settings.mount_point
+    app_ctx.state.set_phase(Phase.reviewing)
+    mount_root.mkdir(parents=True, exist_ok=True)
+    app_ctx.state.mount_path = mount_root.resolve()
+    _write_dup_mount_in(mount_root)
+    p2a = str((mount_root / "a.jpg").resolve())
+    p2b = str((mount_root / "b.jpg").resolve())
+    p3a = str((mount_root / "tri_a.jpg").resolve())
+    p3b = str((mount_root / "tri_b.jpg").resolve())
+    p3c = str((mount_root / "tri_c.jpg").resolve())
+    for p in (p3a, p3b, p3c):
+        Path(p).write_bytes(b"x")
+    g2 = "g_two"
+    g3 = "g_three"
+    app_ctx.state.duplicate_groups = [
+        {
+            "id": g2,
+            "paths": [p2a, p2b],
+            "scan_kind": "exact",
+            "recommendedKeep": p2a,
+            "recommendedKeeps": [p2a],
+        },
+        {
+            "id": g3,
+            "paths": [p3a, p3b, p3c],
+            "scan_kind": "exact",
+            "recommendedKeep": p3a,
+            "recommendedKeeps": [p3a],
+        },
+    ]
+    app_ctx.state.group_keep = {g2: [p2a], g3: [p3a]}
+    gr = test_client.get("/api/scan/groups", params={"kind": "exact", "size_filter": "2"})
+    assert gr.status_code == 200
+    data = gr.json()
+    assert data["total"] == 1
+    assert len(data["groups"]) == 1
+    assert data["size_counts"]["2"] == 1
+    assert data["size_counts"]["3"] == 1
+    pr = test_client.get("/api/delete/preview", params={"kind": "exact", "size_filter": "2"})
+    assert pr.status_code == 200
+    assert pr.json()["file_count"] == 1
+    pr3 = test_client.get("/api/delete/preview", params={"kind": "exact", "size_filter": "3"})
+    assert pr3.json()["file_count"] == 2
+
+
 def test_delete_preview_all_kept_zero_files(test_client, app_ctx, settings):
     mount_root = settings.mount_point
     sub = mount_root / "d2"
@@ -365,6 +411,44 @@ def test_thumbnail_dotdot_rejected(test_client, app_ctx):
     app_ctx.state.mount_path = Path("/tmp")
     r = test_client.get("/api/thumbnail", params={"relpath": ".."})
     assert r.status_code == 400
+
+
+def test_thumbnail_without_live_mount_uses_configured_mount_point(test_client, app_ctx, settings):
+    mount_root = settings.mount_point
+    mount_root.mkdir(parents=True, exist_ok=True)
+    rel = Path("DCIM") / "offline.jpg"
+    full = mount_root / rel
+    full.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (24, 18), "yellow").save(full, "JPEG")
+    app_ctx.state.mount_path = None
+    r = test_client.get("/api/thumbnail", params={"relpath": str(rel).replace(chr(92), "/")})
+    assert r.status_code == 200
+    assert r.headers.get("content-type", "").startswith("image/")
+
+
+def test_scan_groups_include_relpaths(test_client, app_ctx, settings):
+    mount_root = settings.mount_point
+    mount_root.mkdir(parents=True, exist_ok=True)
+    rel = Path("DCIM") / "x.jpg"
+    full = mount_root / rel
+    full.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (10, 10), "blue").save(full, "JPEG")
+    abs_path = str(full.resolve())
+    app_ctx.state.set_phase(Phase.reviewing)
+    app_ctx.state.mount_path = mount_root.resolve()
+    app_ctx.state.duplicate_groups = [
+        {
+            "id": "g_test",
+            "paths": [abs_path],
+            "scan_kind": "exact",
+            "bytesSavedIfOneKept": 0,
+        }
+    ]
+    r = test_client.get("/api/scan/groups", params={"kind": "exact"})
+    assert r.status_code == 200
+    groups = r.json()["groups"]
+    assert len(groups) == 1
+    assert groups[0]["relpaths"] == [str(rel).replace(chr(92), "/")]
 
 
 def test_thumbnail_missing_file(test_client, app_ctx, settings):

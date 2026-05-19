@@ -25,6 +25,7 @@ def write_defaults_yaml(repo_root: Path) -> Path:
             "logs_dir": "_pytest_data/logs",
             "thumbnail_cache_dir": "_pytest_data/thumbs",
             "scan_artifacts_dir": "_pytest_data/scans",
+            "user_scans_dir": "_pytest_data/user_scans",
             "mount_point": "_pytest_data/mount",
         },
         "deletes": {"chunk_size": 5},
@@ -72,6 +73,28 @@ def settings(repo_root: Path, defaults_path: Path) -> Settings:
 def app_ctx(settings: Settings) -> AppCtx:
     sem = threading.BoundedSemaphore(max(1, settings.max_concurrent_thumbnails))
     return AppCtx(settings=settings, state=AppState(), no_open_browser=True, thumb_semaphore=sem)
+
+
+@pytest.fixture(autouse=True)
+def _session_mount_visible_to_bootstrap(app_ctx: AppCtx, monkeypatch):
+    """Treat an in-memory mount_path as mounted when FUSE is not available (pytest)."""
+    from iphone_cleanup import mount as mount_mod
+
+    real = mount_mod.is_mountpoint
+
+    def _is_mountpoint(path: Path) -> bool:
+        if real(path):
+            return True
+        with app_ctx.state.lock:
+            mp = app_ctx.state.mount_path
+        if mp is not None and path.resolve() == mp.resolve():
+            try:
+                return path.resolve().is_dir()
+            except OSError:
+                return False
+        return False
+
+    monkeypatch.setattr("iphone_cleanup.session_bootstrap.mount.is_mountpoint", _is_mountpoint)
 
 
 @pytest.fixture

@@ -20,8 +20,9 @@ def test_app_state_snapshot_and_jobs():
     s.device_info = {"trusted": True}
     snap = s.snapshot()
     assert snap["phase"] == "mounted"
+    assert snap["phase_label"]
     assert snap["device"]["trusted"] is True
-    assert snap["activity_log"] == []
+    assert any("PHASE → mounted" in ln for ln in snap["activity_log"])
 
     job = s.start_job("x", "label")
     log_lines = list(s.activity_log)

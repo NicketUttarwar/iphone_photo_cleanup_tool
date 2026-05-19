@@ -1,0 +1,14 @@
+{
+  "scan_kind": "exact",
+  "groups": [
+    {
+      "id": "g1",
+      "scan_kind": "exact",
+      "paths": [
+        "/path/on/mount/DCIM/100APPLE/IMG_0001.JPG",
+        "/path/on/mount/DCIM/100APPLE/IMG_0001 (1).JPG"
+      ],
+      "bytesSavedIfOneKept": 2457600
+    }
+  ]
+}

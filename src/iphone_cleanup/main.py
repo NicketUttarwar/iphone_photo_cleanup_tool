@@ -11,10 +11,13 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from iphone_cleanup import mount
+from iphone_cleanup import mount, scan_sessions
 from iphone_cleanup.api.routes import router
 from iphone_cleanup.app_context import AppCtx
 from iphone_cleanup.app_log import log_event, setup_file_logging
+from iphone_cleanup.run_session import begin_run_session, end_run_session
+from iphone_cleanup.runtime_session import clear_runtime, load_runtime, persist_runtime
+from iphone_cleanup.session_bootstrap import bootstrap_runtime
 from iphone_cleanup.state import Phase
 
 
@@ -25,8 +28,14 @@ def create_app(ctx: AppCtx) -> FastAPI:
         ctx.settings.logs_dir.mkdir(parents=True, exist_ok=True)
         ctx.settings.thumbnail_cache_dir.mkdir(parents=True, exist_ok=True)
         ctx.settings.scan_artifacts_dir.mkdir(parents=True, exist_ok=True)
+        scan_sessions.ensure_tree(ctx.settings.user_scans_dir)
         ctx.settings.mount_point.parent.mkdir(parents=True, exist_ok=True)
         setup_file_logging(ctx.settings.logs_dir, ctx.settings.log_level)
+        begin_run_session(ctx)
+        load_runtime(ctx)
+        scan_sessions.bootstrap_active_session(ctx)
+        bootstrap_runtime(ctx)
+        persist_runtime(ctx, force=True)
         log_event("server_start", host=ctx.settings.server_host, port=ctx.settings.server_port)
         url = f"http://{ctx.settings.server_host}:{ctx.settings.server_port}/"
         if ctx.settings.ui_open_browser and not ctx.no_open_browser:
@@ -92,4 +101,5 @@ def _shutdown(ctx: AppCtx) -> None:
     ctx.state.mount_path = None
     ctx.state.mount_udid = None
     ctx.state.set_phase(Phase.idle)
+    end_run_session(ctx)
     log_event("server_stop")

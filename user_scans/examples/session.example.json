@@ -1,0 +1,11 @@
+{
+  "id": "20260518_143022_exact_a1b2c3d4",
+  "label": "Exact · May 18, 2026 2:30 PM",
+  "scan_kind": "exact",
+  "created_at": 1716039022.5,
+  "updated_at": 1716039022.5,
+  "group_count": 12,
+  "mount_udid": "00008110-001A2B3C4D5E6F7A",
+  "mount_path": "/Users/you/iphone_photo_cleanup_tool/data/iphone_mount",
+  "results_file": "results.json"
+}

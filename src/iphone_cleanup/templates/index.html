@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Nicket's iPhone CleanUp</title>
-  <link rel="stylesheet" href="/static/app.css" />
+  <link rel="stylesheet" href="/static/app.css?v=3" />
 </head>
 <body>
   <header class="top">
@@ -31,28 +31,31 @@
     </div>
   </header>
 
-  <section id="activityHub" class="activity-hub" aria-label="Live progress and activity log">
-    <p class="activity-hub-hint">
-      <strong>Live progress</strong> — this is the primary place to see what the app is doing: each background job
-      shows a bar, a human summary, and a detailed line log below with timestamps. Use <strong>Clear activity log</strong>
-      to wipe the log only (it does not cancel work).
-    </p>
-    <div id="activityJobs" class="activity-jobs" aria-live="polite"></div>
-    <div id="activityDiagnostics" class="activity-diagnostics" aria-live="polite"></div>
+  <section id="activityHub" class="activity-hub" aria-label="Live status and activity log">
+    <div class="activity-hub-head">
+      <div class="activity-status-row" aria-live="polite">
+        <span id="refreshSpinner" class="refresh-spinner" role="status" aria-label="Refreshing"></span>
+        <p id="liveStatusSummary" class="live-status-summary">Connecting to session…</p>
+      </div>
+      <div class="activity-meta" aria-live="polite">
+        <span><strong>Phase:</strong> <span id="phase">…</span></span>
+        <span><strong>Device:</strong> <span id="device">unknown</span></span>
+        <span><strong>Mount:</strong> <span id="mount">—</span></span>
+        <span id="lastRefreshLabel" class="muted activity-refresh-label">Auto-refresh every 5s</span>
+      </div>
+      <div id="activityProgressWrap" class="activity-progress-wrap hidden" aria-hidden="true">
+        <div class="progress-host activity-progress-host">
+          <div id="activityProgressInner" class="progress-bar-inner"></div>
+        </div>
+      </div>
+    </div>
     <div class="activity-log-toolbar">
-      <button type="button" id="btnActivityLogClear" class="ghost">Clear activity log</button>
-      <span class="muted activity-log-toolbar-hint">Clears the scrolling text only — running jobs continue.</span>
+      <button type="button" id="btnActivityLogClear" class="ghost">Clear log</button>
+      <span class="muted activity-log-toolbar-hint">Clears the log display only — background work continues. Lines are also written to <code>data/logs/app.log</code>.</span>
     </div>
     <div class="activity-log-wrap">
-      <div class="activity-log-caption">Activity log (timestamped, newest at bottom)</div>
-      <pre id="activityLog" class="activity-log" aria-live="polite"></pre>
+      <pre id="activityLog" class="activity-log" aria-live="polite" aria-label="Activity log"></pre>
     </div>
-  </section>
-
-  <section id="statusStrip" class="status-strip" aria-live="polite">
-    <div><strong>Phase:</strong> <span id="phase">…</span></div>
-    <div><strong>Device:</strong> <span id="device">unknown</span></div>
-    <div><strong>Mount:</strong> <span id="mount">—</span></div>
   </section>
 
   <p id="nextAction" class="next-action" aria-live="polite"></p>
@@ -63,7 +66,7 @@
   <section class="panel panel-guide" aria-labelledby="guideHeading">
     <h2 id="guideHeading">Step-by-step session</h2>
     <p class="guide-intro">
-      Follow the highlighted step. <strong>Live progress</strong> for mount, scans, deletes, and document moves is always at the <strong>top of this page</strong> (above Phase / Device). If something fails, check <strong>Device</strong> there and the alert banner, then
+      Follow the highlighted step. Mount, scans, deletes, and document moves stream into the <strong>status and log panel at the top</strong> (auto-refreshes every 5 seconds). If something fails, check that panel and the alert banner, then
       <a href="/prerequisites">host prerequisites</a>.
     </p>
     <ol class="steps">
@@ -98,31 +101,26 @@
         </div>
       </li>
       <li class="step" data-guide-step="3">
-        <div class="step-inner">
+        <div class="step-inner step-jump" data-jump-target="exactDupPanel" tabindex="0" role="link" aria-label="Scroll to exact duplicate workflow">
           <span class="step-badge" aria-hidden="true">3</span>
           <div class="step-content">
-            <h3 class="step-title">Find duplicate / similar photos <span class="step-tag">optional</span></h3>
+            <h3 class="step-title">Exact duplicate photos <span class="step-tag">optional</span></h3>
             <p class="step-text">
-              <strong>Exact</strong> finds same-size near-identical files. <strong>Fuzzy roll</strong> walks your library once in capture-time order, caches perceptual hashes on this Mac, then analyzes about a thousand photos per click so you can review burst matches between batches. Cancel stops quickly; you can run either scan after the other when idle.
+              Finds same-size near-identical files. Scan, review keepers, and delete extras in the <strong>Exact duplicate photos</strong> section below — independent from fuzzy roll.
             </p>
-            <div class="btn-row">
-              <button type="button" id="btnScan" class="primary" disabled>Exact duplicate scan</button>
-              <button type="button" id="btnScanFuzzy" class="primary" disabled>Fuzzy roll scan</button>
-              <button type="button" id="btnScanCancel" class="danger-outline" disabled>Cancel scan</button>
-            </div>
-            <p id="scanRunHint" class="hint scan-hint muted" aria-live="polite"></p>
+            <div class="step-jump-hint" aria-hidden="true">Scroll to exact duplicates ↓</div>
           </div>
         </div>
       </li>
       <li class="step" data-guide-step="4">
-        <div class="step-inner step-jump" data-jump-target="dupReview" tabindex="0" role="link" aria-label="Scroll to duplicate review">
+        <div class="step-inner step-jump" data-jump-target="fuzzyRollPanel" tabindex="0" role="link" aria-label="Scroll to fuzzy roll workflow">
           <span class="step-badge" aria-hidden="true">4</span>
           <div class="step-content">
-            <h3 class="step-title">Review duplicates &amp; delete extras</h3>
+            <h3 class="step-title">Fuzzy roll (bursts &amp; same-scene sets) <span class="step-tag">optional</span></h3>
             <p class="step-text">
-              Open duplicate review to see suggested keepers (auto-ranked). Tap thumbnails to toggle <strong>keep</strong> (multiple allowed); if every file in a group is kept, nothing is deleted there. <strong>Fuzzy</strong> bursts use approximate eye counts when MediaPipe is installed (see optional requirements). Tap this card to scroll to the duplicate summary.
+              Walks your library in capture-time order, caches features on this Mac, and analyzes about two thousand photos per batch. Groups burst shots and successive photos with similar scene colors. Review in the <strong>Fuzzy roll</strong> section — separate from exact duplicates.
             </p>
-            <div class="step-jump-hint" aria-hidden="true">Scroll to duplicate summary ↓</div>
+            <div class="step-jump-hint" aria-hidden="true">Scroll to fuzzy roll ↓</div>
           </div>
         </div>
       </li>
@@ -147,7 +145,7 @@
               <strong>Before unplugging USB:</strong> close any Finder windows showing the iPhone volume, then unmount here. That flushes the session and clears the document holding area.
             </p>
             <p class="hint">
-              Unmount is always available while the phone is mounted — including during an exact or fuzzy scan (it signals cancel) or during a duplicate delete. When unmount succeeds, it clears the document holding folder on this Mac; only unmount when you are done with undo / finalize.
+              Unmount is always available while the phone is mounted — including during a scan (it signals cancel) or during a delete. When unmount succeeds, it clears the document holding folder on this Mac; only unmount when you are done with undo / finalize.
             </p>
             <div class="btn-row">
               <button type="button" id="btnUnmount" class="danger-outline">Unmount (safe)</button>
@@ -158,28 +156,132 @@
     </ol>
   </section>
 
-  <section class="panel" id="dupReview">
-    <h2>Duplicate review</h2>
-    <p id="dupReviewTeaser" class="dup-teaser" aria-live="polite"></p>
-    <div class="btn-row">
-      <button type="button" id="btnDupReviewOpen" class="primary" disabled>Open duplicate review…</button>
+  <section class="panel workflow-panel workflow-exact" id="exactDupPanel">
+    <h2>Exact duplicate photos</h2>
+    <p class="hint workflow-intro">
+      Separate workflow for byte-identical / same-size near-duplicate files. On large libraries (10k–100k+ photos) the first exact scan walks the full roll once; review loads sets in pages with every photo in each set shown at full frame (scroll horizontally within a set).
+    </p>
+
+    <h3 class="workflow-subhead">Saved exact scans</h3>
+    <p class="hint scan-workspace-intro">Click a saved scan to load it and open review — no rescan required. Keep/delete choices are saved back to that scan. The latest exact scan is active by default.</p>
+    <div id="exactScanWorkspaceLoading" class="scan-workspace-loading hidden" aria-live="polite" aria-busy="false">
+      <span class="refresh-spinner spinning" aria-hidden="true"></span>
+      <span>Loading scan…</span>
     </div>
-    <p class="hint muted">Opens a large overlay (almost full screen) with a scrollable list so you can compare photos comfortably.</p>
+    <div id="exactScanWorkspaceEmpty" class="scan-workspace-empty hidden" aria-live="polite">
+      <p>No saved exact scans yet. Mount the iPhone, then run <strong>Exact duplicate scan</strong> below.</p>
+    </div>
+    <ul id="exactScanSessionList" class="scan-session-list" role="listbox" aria-label="Saved exact scans"></ul>
+
+    <h3 class="workflow-subhead">Scan</h3>
+    <div class="btn-row">
+      <button type="button" id="btnScan" class="primary" disabled>Exact duplicate scan</button>
+      <button type="button" id="btnScanCancelExact" class="danger-outline" disabled>Cancel exact scan</button>
+    </div>
+    <p id="exactScanRunHint" class="hint scan-hint muted" aria-live="polite"></p>
+
+    <h3 class="workflow-subhead">Review &amp; delete</h3>
+    <p id="exactDupReviewTeaser" class="dup-teaser" aria-live="polite"></p>
+    <div class="btn-row">
+      <button type="button" id="btnExactDupReviewOpen" class="primary" disabled>Open exact duplicate review…</button>
+    </div>
+    <p class="hint muted">Review opens automatically when a scan finishes. Groups and photos load page by page to stay light on large libraries.</p>
   </section>
 
-  <dialog id="dlgDupReview" class="dup-review-dialog" aria-labelledby="dupPopoutHeading">
+  <dialog id="dlgExactDupReview" class="dup-review-dialog" aria-labelledby="exactDupPopoutHeading">
     <div class="dup-review-dialog-inner">
       <header class="dup-popout-toolbar">
-        <h3 id="dupPopoutHeading" class="dup-popout-title">Duplicate review</h3>
-        <button type="button" id="btnDupReviewClose" class="ghost small-btn" aria-label="Close duplicate review panel">Close</button>
+        <h3 id="exactDupPopoutHeading" class="dup-popout-title">Exact duplicate review</h3>
+        <button type="button" id="btnExactDupReviewClose" class="ghost small-btn" aria-label="Close exact duplicate review">Close</button>
       </header>
       <p class="hint dup-popout-hint">
-        <strong>Auto-ranked keepers:</strong> Exact duplicates use sharpness, resolution, and recency (plus optional face/eye when enabled in config). Fuzzy bursts favor approximate eye counts when MediaPipe is available. Tap photos to change keep marks (multiple per group). Use <strong>Keep all in group</strong> beside each heading to select every file at once, then tap tiles to remove keep where needed. Delete only removes files you did <em>not</em> mark keep. If every file in a group is kept, that group contributes nothing to delete.
+        <strong>Auto-ranked keepers</strong> use sharpness, resolution, and recency (plus optional face/eye when enabled in config). Each set shows every photo at full frame (no cropping). Tap a photo to toggle keep; use <strong>Keep all in set</strong> then tap to remove keep where needed. Scroll horizontally within a set to compare shots. Review and delete apply only to the set size you pick below.
       </p>
-      <div id="groups" class="groups dup-popout-groups"></div>
+      <div class="review-size-filter" aria-labelledby="exactReviewSizeFilterLabel">
+        <div class="review-size-filter-head">
+          <span id="exactReviewSizeFilterLabel" class="review-size-filter-title">Show sets with</span>
+          <span id="exactReviewSizeValue" class="review-size-filter-value">All sizes</span>
+        </div>
+        <input type="range" id="exactReviewSizeSlider" class="review-size-slider" min="0" max="4" step="1" value="0" aria-valuemin="0" aria-valuemax="4" aria-valuenow="0" aria-label="Filter duplicate sets by number of photos" />
+        <div class="review-size-filter-ticks" aria-hidden="true">
+          <span>All</span><span>2</span><span>3</span><span>4</span><span>5+</span>
+        </div>
+        <p id="exactReviewSizeHint" class="hint muted review-size-filter-hint" aria-live="polite"></p>
+      </div>
+      <div id="exactGroups" class="groups dup-popout-groups"></div>
+      <nav id="exactGroupsPager" class="groups-pager paged-review-nav hidden" aria-live="polite">
+        <button type="button" id="btnExactReviewPrev" class="ghost">← Previous</button>
+        <span id="exactReviewPageLabel" class="groups-pager-meta paged-review-label muted"></span>
+        <button type="button" id="btnExactReviewNext" class="ghost">Next →</button>
+      </nav>
       <footer class="dup-popout-footer btn-row">
-        <button type="button" id="btnDupReviewCloseFooter" class="ghost">Close</button>
-        <button type="button" id="btnDelete" class="danger">Delete non-kept duplicates…</button>
+        <button type="button" id="btnExactDupReviewCloseFooter" class="ghost">Close</button>
+        <button type="button" id="btnDeleteExact" class="danger">Delete non-kept exact duplicates…</button>
+      </footer>
+    </div>
+  </dialog>
+
+  <section class="panel workflow-panel workflow-fuzzy" id="fuzzyRollPanel">
+    <h2>Fuzzy roll (bursts &amp; same-scene sets)</h2>
+    <p class="hint workflow-intro">
+      Separate workflow for similar adjacent shots in capture-time order. By default one scan walks and hashes every photo on the mount (fast file-date sort; features cached on this Mac). Review is paginated; each set lists every photo at full frame — scroll horizontally to compare.
+    </p>
+
+    <h3 class="workflow-subhead">Saved fuzzy scans</h3>
+    <p class="hint scan-workspace-intro">Click a saved scan to load it and open review — no rescan required. Keep/delete choices are saved back to that scan. The latest fuzzy scan is active by default.</p>
+    <div id="fuzzyScanWorkspaceLoading" class="scan-workspace-loading hidden" aria-live="polite" aria-busy="false">
+      <span class="refresh-spinner spinning" aria-hidden="true"></span>
+      <span>Loading scan…</span>
+    </div>
+    <div id="fuzzyScanWorkspaceEmpty" class="scan-workspace-empty hidden" aria-live="polite">
+      <p>No saved fuzzy scans yet. Mount the iPhone, then run <strong>Fuzzy roll scan</strong> below.</p>
+    </div>
+    <ul id="fuzzyScanSessionList" class="scan-session-list" role="listbox" aria-label="Saved fuzzy scans"></ul>
+
+    <h3 class="workflow-subhead">Scan</h3>
+    <div class="btn-row">
+      <button type="button" id="btnScanFuzzy" class="primary" disabled>Fuzzy roll scan</button>
+      <button type="button" id="btnScanCancelFuzzy" class="danger-outline" disabled>Cancel fuzzy scan</button>
+    </div>
+    <p id="fuzzyScanRunHint" class="hint scan-hint muted" aria-live="polite"></p>
+
+    <h3 class="workflow-subhead">Review &amp; delete</h3>
+    <p id="fuzzyDupReviewTeaser" class="dup-teaser" aria-live="polite"></p>
+    <div class="btn-row">
+      <button type="button" id="btnFuzzyDupReviewOpen" class="primary" disabled>Open fuzzy set review…</button>
+    </div>
+    <p class="hint muted">Review opens automatically after each fuzzy batch. Groups and photos load page by page. Keepers favor approximate eye counts when MediaPipe is installed.</p>
+  </section>
+
+  <dialog id="dlgFuzzyDupReview" class="dup-review-dialog" aria-labelledby="fuzzyDupPopoutHeading">
+    <div class="dup-review-dialog-inner">
+      <header class="dup-popout-toolbar">
+        <h3 id="fuzzyDupPopoutHeading" class="dup-popout-title">Fuzzy set review</h3>
+        <button type="button" id="btnFuzzyDupReviewClose" class="ghost small-btn" aria-label="Close fuzzy set review">Close</button>
+      </header>
+      <p class="hint dup-popout-hint">
+        <strong>Fuzzy sets</strong> (bursts or same-scene colors) favor approximate eye counts when MediaPipe is available. Every photo is shown uncropped at full frame; scroll horizontally within a set to compare. Tap to toggle keep; use <strong>Keep all in set</strong> beside each heading. Review and delete apply only to the set size you pick below.
+      </p>
+      <div class="review-size-filter" aria-labelledby="fuzzyReviewSizeFilterLabel">
+        <div class="review-size-filter-head">
+          <span id="fuzzyReviewSizeFilterLabel" class="review-size-filter-title">Show sets with</span>
+          <span id="fuzzyReviewSizeValue" class="review-size-filter-value">All sizes</span>
+        </div>
+        <input type="range" id="fuzzyReviewSizeSlider" class="review-size-slider" min="0" max="4" step="1" value="0" aria-valuemin="0" aria-valuemax="4" aria-valuenow="0" aria-label="Filter burst sets by number of photos" />
+        <div class="review-size-filter-ticks" aria-hidden="true">
+          <span>All</span><span>2</span><span>3</span><span>4</span><span>5+</span>
+        </div>
+        <p id="fuzzyReviewSizeHint" class="hint muted review-size-filter-hint" aria-live="polite"></p>
+      </div>
+      <div id="fuzzyGroups" class="groups dup-popout-groups"></div>
+      <nav id="fuzzyGroupsPager" class="groups-pager paged-review-nav hidden" aria-live="polite">
+        <button type="button" id="btnFuzzyReviewPrev" class="ghost">← Previous</button>
+        <span id="fuzzyReviewPageLabel" class="groups-pager-meta paged-review-label muted"></span>
+        <button type="button" id="btnFuzzyReviewNext" class="ghost">Next →</button>
+      </nav>
+      <footer class="dup-popout-footer btn-row">
+        <button type="button" id="btnFuzzyDupReviewCloseFooter" class="ghost">Close</button>
+        <button type="button" id="btnDeleteFuzzy" class="danger">Delete non-kept fuzzy bursts…</button>
       </footer>
     </div>
   </dialog>
@@ -200,6 +302,11 @@
     <p id="docLivePreviewLabel" class="live-preview-label muted">Matches for your choices (updates when you change options above)</p>
     <div id="docPreviewSummary" class="preview-summary" aria-live="polite">Mount the phone to see matches.</div>
     <div id="docPreviewStrip" class="preview-thumb-strip hidden" aria-hidden="true"></div>
+    <nav id="docPreviewPager" class="paged-review-nav hidden" aria-live="polite">
+      <button type="button" id="btnDocPreviewPrev" class="ghost">← Previous</button>
+      <span id="docPreviewPagerLabel" class="paged-review-label muted"></span>
+      <button type="button" id="btnDocPreviewNext" class="ghost">Next →</button>
+    </nav>
     <div class="btn-row">
       <button type="button" id="btnDocRemove" class="primary">Remove from phone…</button>
       <button type="button" id="btnDocUndo">Undo latest batch</button>
@@ -218,18 +325,44 @@
     <div id="lastDeleteBody" class="hint"></div>
   </section>
 
-  <dialog id="dlgDelete">
-    <form method="dialog" id="formDelete">
-      <p>This deletes every duplicate file in each group <strong>except</strong> the one marked keep.</p>
-      <div id="deletePreviewSummary" class="preview-summary dlg-preview-text"></div>
-      <div id="deletePreviewStrip" class="preview-thumb-strip dlg-preview-strip" aria-label="Sample images to be removed"></div>
-      <p class="dlg-preview-hint muted">Sample: one non-keeper per group (capped) so the UI stays responsive.</p>
+  <dialog id="dlgDeleteExact">
+    <form method="dialog" id="formDeleteExact">
+      <p>This deletes every <strong>exact duplicate</strong> file in each group <strong>except</strong> those marked keep.</p>
+      <div id="deleteExactPreviewSummary" class="preview-summary dlg-preview-text"></div>
+      <div id="deleteExactPreviewStrip" class="preview-thumb-strip dlg-preview-strip" aria-label="Sample exact duplicate images to remove"></div>
+      <nav id="deleteExactPreviewPager" class="paged-review-nav hidden" aria-live="polite">
+        <button type="button" id="btnDeleteExactPreviewPrev" class="ghost">← Previous</button>
+        <span id="deleteExactPreviewPagerLabel" class="paged-review-label muted"></span>
+        <button type="button" id="btnDeleteExactPreviewNext" class="ghost">Next →</button>
+      </nav>
+      <p class="dlg-preview-hint muted">Deletes only non-kept files in the set-size view you chose in review (e.g. 2-photo sets only). Other sizes are not touched.</p>
       <p>Type the phrase exactly:</p>
       <p><code>DELETE_SELECTED_FILES</code></p>
-      <input type="text" id="confirmInput" autocomplete="off" />
+      <input type="text" id="confirmInputExact" autocomplete="off" />
       <div class="dlg-actions">
-        <button type="button" value="cancel" id="btnCancelDelete">Cancel</button>
-        <button type="button" id="btnConfirmDelete" class="danger">Delete</button>
+        <button type="button" value="cancel" id="btnCancelDeleteExact">Cancel</button>
+        <button type="button" id="btnConfirmDeleteExact" class="danger">Delete</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="dlgDeleteFuzzy">
+    <form method="dialog" id="formDeleteFuzzy">
+      <p>This deletes every <strong>fuzzy burst</strong> file in each group <strong>except</strong> those marked keep.</p>
+      <div id="deleteFuzzyPreviewSummary" class="preview-summary dlg-preview-text"></div>
+      <div id="deleteFuzzyPreviewStrip" class="preview-thumb-strip dlg-preview-strip" aria-label="Sample fuzzy burst images to remove"></div>
+      <nav id="deleteFuzzyPreviewPager" class="paged-review-nav hidden" aria-live="polite">
+        <button type="button" id="btnDeleteFuzzyPreviewPrev" class="ghost">← Previous</button>
+        <span id="deleteFuzzyPreviewPagerLabel" class="paged-review-label muted"></span>
+        <button type="button" id="btnDeleteFuzzyPreviewNext" class="ghost">Next →</button>
+      </nav>
+      <p class="dlg-preview-hint muted">Deletes only non-kept files in the set-size view you chose in review. Other sizes are not touched.</p>
+      <p>Type the phrase exactly:</p>
+      <p><code>DELETE_SELECTED_FILES</code></p>
+      <input type="text" id="confirmInputFuzzy" autocomplete="off" />
+      <div class="dlg-actions">
+        <button type="button" value="cancel" id="btnCancelDeleteFuzzy">Cancel</button>
+        <button type="button" id="btnConfirmDeleteFuzzy" class="danger">Delete</button>
       </div>
     </form>
   </dialog>
@@ -239,7 +372,12 @@
       <p>Removal copies each file to this Mac first, then deletes it from the phone. Scope matches the options you set in <strong>Document-style photos</strong> above.</p>
       <div id="docDlgPreviewSummary" class="preview-summary dlg-preview-text"></div>
       <div id="docDlgPreviewStrip" class="preview-thumb-strip dlg-preview-strip" aria-label="Sample document images to remove"></div>
-      <p class="dlg-preview-hint">Count and size include every match; thumbnails are a capped sample.</p>
+      <nav id="docDlgPreviewPager" class="paged-review-nav hidden" aria-live="polite">
+        <button type="button" id="btnDocDlgPreviewPrev" class="ghost">← Previous</button>
+        <span id="docDlgPreviewPagerLabel" class="paged-review-label muted"></span>
+        <button type="button" id="btnDocDlgPreviewNext" class="ghost">Next →</button>
+      </nav>
+      <p class="dlg-preview-hint">Count and size include every match; thumbnails load page by page.</p>
       <p class="hint" style="margin-top:0.75rem">Type exactly:</p>
       <p><code>REMOVE_TAGGED_DOCUMENTS</code></p>
       <input type="text" id="docConfirmInput" autocomplete="off" />
@@ -266,6 +404,9 @@
     </div>
   </dialog>
 
-  <script src="/static/app.js"></script>
+  <script>
+    window.__APP_POLL_MS__ = {{ poll_ms }};
+  </script>
+  <script src="/static/app.js?v=3"></script>
 </body>
 </html>
