@@ -1,4 +1,10 @@
 
+
+See image_of_kernel_permission_step.png for an image of the permissions step for allowing kernel extensions
+See screenshot_of_app for image of what the app looks like
+
+
+
 iPhone Photo Cleanup Tool — ReadMe
 ==================================
 
@@ -28,7 +34,7 @@ APPLE SILICON: KERNEL EXTENSIONS (macFUSE / FUSE)
 -------------------------------------------------
 **macFUSE** uses a **kernel extension** (kext). On **Mac with Apple silicon** (M1/M2/M3/M4 or later), Apple does **not** let you fully enable that from normal macOS alone the first time: you must boot into **macOS Recovery**, open **Utilities → Startup Security Utility**, select your startup volume, choose **Security Policy**, enable **Reduced Security**, check **Allow user management of kernel extensions from identified developers**, confirm, then **restart** from the Apple menu so the Mac boots back into regular macOS. After that reboot you may still need to approve the extension or app in **System Settings** per your installer’s prompts.
 
-Step-by-step guide (print or open on another device before entering Recovery):  
+Step-by-step guide (print or open on another device before entering Recovery):
 https://www.sweetwater.com/sweetcare/articles/kernel-extensions-on-mac-with-apple-silicon
 
 **FYI for new machines or new macOS installs:** expect at least one **full reboot** after the Recovery change before FUSE/macFUSE-backed tools behave; if **`ifuse`** or mounting failed before you did this, finish Recovery + reboot + any System Settings approvals, then run **`./scripts/run.sh`** or **`scripts/check_host_prerequisites.sh`** again.
@@ -125,4 +131,3 @@ If you invalidate an assumption, update **docs/** in the same change so architec
 OTHER FILES
 -----------
 - **multi-phone-one-acct-strategy.txt** — ideas for multi-phone / same-account cloud photo setups; optional reading, not core to the USB cleanup tool.
-
