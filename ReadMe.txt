@@ -1,12 +1,11 @@
-
-
-See image_of_kernel_permission_step.png for an image of the permissions step for allowing kernel extensions
-See screenshot_of_app for image of what the app looks like
-
-
-
 iPhone Photo Cleanup Tool — ReadMe
 ==================================
+
+**The unified project readme is now README.md** (screenshots, setup, kernel permissions, scripts).
+This file is kept for historical notes and assumptions below.
+
+See image_of_kernel_permission_step.png for kernel extension permissions (also in README.md).
+See screenshot_of_app.png for what the app looks like.
 
 CURRENT STATE OF THIS REPOSITORY (as of last update)
 ----------------------------------------------------
