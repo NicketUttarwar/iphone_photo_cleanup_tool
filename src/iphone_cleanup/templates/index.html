@@ -336,12 +336,9 @@
         <button type="button" id="btnDeleteExactPreviewNext" class="ghost">Next →</button>
       </nav>
       <p class="dlg-preview-hint muted">Deletes only non-kept files in the set-size view you chose in review (e.g. 2-photo sets only). Other sizes are not touched.</p>
-      <p>Type the phrase exactly:</p>
-      <p><code>DELETE_SELECTED_FILES</code></p>
-      <input type="text" id="confirmInputExact" autocomplete="off" />
       <div class="dlg-actions">
         <button type="button" value="cancel" id="btnCancelDeleteExact">Cancel</button>
-        <button type="button" id="btnConfirmDeleteExact" class="danger">Delete</button>
+        <button type="button" id="btnConfirmDeleteExact" class="danger">Continue to confirmation…</button>
       </div>
     </form>
   </dialog>
@@ -357,12 +354,9 @@
         <button type="button" id="btnDeleteFuzzyPreviewNext" class="ghost">Next →</button>
       </nav>
       <p class="dlg-preview-hint muted">Deletes only non-kept files in the set-size view you chose in review. Other sizes are not touched.</p>
-      <p>Type the phrase exactly:</p>
-      <p><code>DELETE_SELECTED_FILES</code></p>
-      <input type="text" id="confirmInputFuzzy" autocomplete="off" />
       <div class="dlg-actions">
         <button type="button" value="cancel" id="btnCancelDeleteFuzzy">Cancel</button>
-        <button type="button" id="btnConfirmDeleteFuzzy" class="danger">Delete</button>
+        <button type="button" id="btnConfirmDeleteFuzzy" class="danger">Continue to confirmation…</button>
       </div>
     </form>
   </dialog>
@@ -378,12 +372,9 @@
         <button type="button" id="btnDocDlgPreviewNext" class="ghost">Next →</button>
       </nav>
       <p class="dlg-preview-hint">Count and size include every match; thumbnails load page by page.</p>
-      <p class="hint" style="margin-top:0.75rem">Type exactly:</p>
-      <p><code>REMOVE_TAGGED_DOCUMENTS</code></p>
-      <input type="text" id="docConfirmInput" autocomplete="off" />
       <div class="dlg-actions">
         <button type="button" id="btnDocCancel">Cancel</button>
-        <button type="button" id="btnDocConfirm" class="danger">Remove</button>
+        <button type="button" id="btnDocConfirm" class="danger">Continue to confirmation…</button>
       </div>
     </div>
   </dialog>
@@ -404,9 +395,30 @@
     </div>
   </dialog>
 
+  <dialog id="dlgDeletionConfirm" class="deletion-confirm-dialog">
+    <h2 class="deletion-confirm-title">Confirm deletion</h2>
+    <p class="deletion-confirm-lead">You are about to permanently delete pictures from your iPhone.</p>
+    <div class="deletion-confirm-stats" aria-live="polite">
+      <div class="deletion-stat">
+        <span class="deletion-stat-value" id="deletionConfirmCount">0</span>
+        <span class="deletion-stat-label">pictures to delete</span>
+      </div>
+      <div class="deletion-stat">
+        <span class="deletion-stat-value" id="deletionConfirmBytes">0 GB</span>
+        <span class="deletion-stat-label">space to free</span>
+      </div>
+    </div>
+    <p id="deletionConfirmContext" class="deletion-confirm-context muted"></p>
+    <p id="deletionConfirmNote" class="dlg-preview-hint"></p>
+    <div class="dlg-actions">
+      <button type="button" id="btnDeletionConfirmCancel">Cancel</button>
+      <button type="button" id="btnDeletionConfirmProceed" class="danger">Proceed with deletion</button>
+    </div>
+  </dialog>
+
   <script>
     window.__APP_POLL_MS__ = {{ poll_ms }};
   </script>
-  <script src="/static/app.js?v=3"></script>
+  <script src="/static/app.js?v=4"></script>
 </body>
 </html>

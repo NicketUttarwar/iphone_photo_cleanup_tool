@@ -59,6 +59,13 @@ let activeFuzzyScanSessionId = "";
 let scanSessionsLoadingExact = false;
 let scanSessionsLoadingFuzzy = false;
 
+const deletePreviewStats = {
+  exact: { count: 0, bytes: 0 },
+  fuzzy: { count: 0, bytes: 0 },
+};
+let docRemovePreviewStats = { count: 0, bytes: 0 };
+let deletionConfirmProceed = null;
+
 const SCAN_WORKFLOWS = {
   exact: {
     kind: "exact",
@@ -78,7 +85,6 @@ const SCAN_WORKFLOWS = {
     dlgDeleteId: "dlgDeleteExact",
     deleteSummaryId: "deleteExactPreviewSummary",
     deleteStripId: "deleteExactPreviewStrip",
-    confirmInputId: "confirmInputExact",
     btnConfirmDeleteId: "btnConfirmDeleteExact",
     btnCancelDeleteId: "btnCancelDeleteExact",
     panelId: "exactDupPanel",
@@ -110,7 +116,6 @@ const SCAN_WORKFLOWS = {
     dlgDeleteId: "dlgDeleteFuzzy",
     deleteSummaryId: "deleteFuzzyPreviewSummary",
     deleteStripId: "deleteFuzzyPreviewStrip",
-    confirmInputId: "confirmInputFuzzy",
     btnConfirmDeleteId: "btnConfirmDeleteFuzzy",
     btnCancelDeleteId: "btnCancelDeleteFuzzy",
     panelId: "fuzzyRollPanel",
@@ -185,6 +190,53 @@ function formatHumanBytes(bytes) {
   }
   const label = units[ui];
   return `${v < 10 ? v.toFixed(1) : Math.round(v)} ${label}`;
+}
+
+function formatPictureCount(n) {
+  const count = Number(n);
+  if (!Number.isFinite(count) || count < 0) return "0";
+  return String(Math.round(count));
+}
+
+function showDeletionConfirmDialog({ fileCount, totalBytes, contextLabel, note, onProceed }) {
+  const dlg = document.getElementById("dlgDeletionConfirm");
+  const countEl = document.getElementById("deletionConfirmCount");
+  const bytesEl = document.getElementById("deletionConfirmBytes");
+  const contextEl = document.getElementById("deletionConfirmContext");
+  const noteEl = document.getElementById("deletionConfirmNote");
+  const btnProceed = document.getElementById("btnDeletionConfirmProceed");
+  if (!dlg || !countEl || !bytesEl || !btnProceed) return;
+  const count = Math.max(0, Number(fileCount) || 0);
+  countEl.textContent = formatPictureCount(count);
+  bytesEl.textContent = formatHumanBytes(totalBytes);
+  if (contextEl) {
+    contextEl.textContent = contextLabel || "";
+    contextEl.classList.toggle("hidden", !contextLabel);
+  }
+  if (noteEl) {
+    noteEl.textContent = note || "";
+    noteEl.classList.toggle("hidden", !note);
+  }
+  btnProceed.disabled = count === 0;
+  btnProceed.textContent =
+    count === 1 ? "Proceed — delete 1 picture" : `Proceed — delete ${formatPictureCount(count)} pictures`;
+  deletionConfirmProceed = count > 0 ? onProceed : null;
+  dlg.showModal();
+}
+
+function wireDeletionConfirmDialog() {
+  const dlg = document.getElementById("dlgDeletionConfirm");
+  document.getElementById("btnDeletionConfirmCancel")?.addEventListener("click", () => {
+    deletionConfirmProceed = null;
+    dlg?.close();
+  });
+  document.getElementById("btnDeletionConfirmProceed")?.addEventListener("click", async (e) => {
+    e.preventDefault();
+    const fn = deletionConfirmProceed;
+    deletionConfirmProceed = null;
+    dlg?.close();
+    if (fn) await fn();
+  });
 }
 
 function scrollToLiveProgress() {
@@ -466,6 +518,9 @@ async function fillDocPreviewInto(summaryEl, stripEl, opts) {
   const j = await res.json();
   const n = j.count ?? 0;
   const bytes = j.total_bytes ?? 0;
+  if (pagerUi === "dlg") {
+    docRemovePreviewStats = { count: n, bytes };
+  }
   if (n === 0) {
     summaryEl.innerHTML = "<strong>No matches</strong> for these options — nothing would be removed.";
   } else {
@@ -489,7 +544,7 @@ async function fillDocPreviewInto(summaryEl, stripEl, opts) {
     thumbTotal,
     previewPageSize,
   );
-  return { ok: true, count: n, thumbTotal };
+  return { ok: true, count: n, bytes, thumbTotal };
 }
 
 function scheduleDocPanelPreview() {
@@ -545,6 +600,7 @@ async function loadDeletePreviewDialog(kind, page = 0) {
   const j = await res.json();
   const n = j.file_count ?? 0;
   const bytes = j.total_bytes ?? 0;
+  deletePreviewStats[pagerKey] = { count: n, bytes };
   const gw = j.groups_with_deletions ?? 0;
   const dg = j.duplicate_group_count ?? 0;
   if (n === 0) {
@@ -1543,29 +1599,43 @@ function wireWorkflowReview(kind) {
   document.getElementById(wf.btnCancelDeleteId)?.addEventListener("click", () => dlgDel?.close());
   document.getElementById(wf.btnConfirmDeleteId)?.addEventListener("click", async (e) => {
     e.preventDefault();
-    scrollToLiveProgress();
-    const phrase = document.getElementById(wf.confirmInputId)?.value.trim() || "";
-    const sizeFilter = reviewPagerState[reviewPagerKey(kind)].sizeFilter || "all";
-    optimisticBusyPhase("deleting");
-    const res = await fetch(
-      `/api/delete?kind=${encodeURIComponent(wf.kind)}&${sizeFilterQueryParam(sizeFilter)}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ paths: [], confirm: phrase }),
-      },
-    );
-    const j = await res.json().catch(() => ({}));
-    if (!res.ok) toast(`Delete blocked: ${j.detail || res.status}`);
-    else toast("Deleting — watch live progress at the top.");
+    const pagerKey = reviewPagerKey(kind);
+    const stats = deletePreviewStats[pagerKey];
+    if (!stats?.count) return;
+    const sizeFilter = reviewPagerState[pagerKey].sizeFilter || "all";
+    const sfMeta = sizeFilterMeta(sizeFilter);
+    const contextLabel =
+      kind === "fuzzy"
+        ? `Fuzzy burst cleanup · ${sfMeta.deleteScope}`
+        : `Exact duplicate cleanup · ${sfMeta.deleteScope}`;
     dlgDel?.close();
-    const inp = document.getElementById(wf.confirmInputId);
-    if (inp) inp.value = "";
-    await refreshStatusFromServer();
+    showDeletionConfirmDialog({
+      fileCount: stats.count,
+      totalBytes: stats.bytes,
+      contextLabel,
+      note: "Files are removed from your iPhone. This cannot be undone on the phone.",
+      onProceed: async () => {
+        scrollToLiveProgress();
+        optimisticBusyPhase("deleting");
+        const res = await fetch(
+          `/api/delete?kind=${encodeURIComponent(wf.kind)}&${sizeFilterQueryParam(sizeFilter)}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ paths: [], confirm: "DELETE_SELECTED_FILES" }),
+          },
+        );
+        const j = await res.json().catch(() => ({}));
+        if (!res.ok) toast(`Delete blocked: ${j.detail || res.status}`);
+        else toast("Deleting — watch live progress at the top.");
+        await refreshStatusFromServer();
+      },
+    });
   });
 }
 
 function wireButtons() {
+  wireDeletionConfirmDialog();
   wireStepJumps();
   wireWorkflowReview("exact");
   wireWorkflowReview("fuzzy");
@@ -1708,36 +1778,48 @@ function wireButtons() {
   document.getElementById("btnDocCancel").addEventListener("click", () => dlgDoc.close());
   document.getElementById("btnDocConfirm").addEventListener("click", async (e) => {
     e.preventDefault();
-    scrollToLiveProgress();
-    mergeSnapshotPatch({
-      jobs: [
-        {
-          running: true,
-          kind: "document_remove",
-          label: "Removing document images…",
-          message: "Starting…",
-        },
-      ],
-    });
+    const stats = docRemovePreviewStats;
+    if (!stats?.count) return;
     const scopeEl = document.querySelector('input[name="docScope"]:checked');
     const scope = scopeEl ? scopeEl.value : "older_than_90d";
     const include_visual_fallback = document.getElementById("docVisualFallback").checked;
-    const confirm = document.getElementById("docConfirmInput").value.trim();
-    const res = await fetch("/api/documents/remove", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ scope, confirm, include_visual_fallback }),
-    });
-    const j = await res.json().catch(() => ({}));
-    if (!res.ok) toast(`Document removal blocked: ${j.detail || res.status}`);
-    else {
-      lastDocPreviewKey = "";
-      scheduleDocPanelPreview();
-      toast("Copying to Mac and removing from phone — watch live progress at the top.");
-    }
     dlgDoc.close();
-    document.getElementById("docConfirmInput").value = "";
-    await refreshStatusFromServer();
+    showDeletionConfirmDialog({
+      fileCount: stats.count,
+      totalBytes: stats.bytes,
+      contextLabel: `Document-style photo removal · ${scope}`,
+      note: "Each file is copied to this Mac first, then deleted from the phone.",
+      onProceed: async () => {
+        scrollToLiveProgress();
+        mergeSnapshotPatch({
+          jobs: [
+            {
+              running: true,
+              kind: "document_remove",
+              label: "Removing document images…",
+              message: "Starting…",
+            },
+          ],
+        });
+        const res = await fetch("/api/documents/remove", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            scope,
+            confirm: "REMOVE_TAGGED_DOCUMENTS",
+            include_visual_fallback,
+          }),
+        });
+        const j = await res.json().catch(() => ({}));
+        if (!res.ok) toast(`Document removal blocked: ${j.detail || res.status}`);
+        else {
+          lastDocPreviewKey = "";
+          scheduleDocPanelPreview();
+          toast("Copying to Mac and removing from phone — watch live progress at the top.");
+        }
+        await refreshStatusFromServer();
+      },
+    });
   });
   document.getElementById("btnDocUndo").addEventListener("click", async () => {
     scrollToLiveProgress();

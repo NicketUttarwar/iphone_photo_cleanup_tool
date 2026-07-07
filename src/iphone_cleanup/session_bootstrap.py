@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from iphone_cleanup import device_bridge, mount
+import threading
+
+from iphone_cleanup import device_bridge, mount, scan, scan_sessions
 from iphone_cleanup.app_context import AppCtx
+from iphone_cleanup.runtime_session import clear_runtime
 from iphone_cleanup.state import Phase
 
 _BUSY_PHASES = frozenset(
@@ -99,6 +102,50 @@ def sync_mount_from_disk(ctx: AppCtx) -> None:
         ctx.state.set_phase(Phase.device_detected if trusted else Phase.idle)
     elif phase == Phase.unmounting:
         ctx.state.set_phase(Phase.idle)
+
+
+def prepare_fresh_scan_run(ctx: AppCtx) -> None:
+    """Drop saved scans and fuzzy-roll caches so each app run starts from a clean slate."""
+    n_sessions = scan_sessions.clear_all_sessions(ctx.settings.user_scans_dir)
+    n_cache = scan.clear_fuzzy_roll_cache(ctx.settings.scan_artifacts_dir)
+    scan_sessions.reset_scan_state(ctx)
+    clear_runtime(ctx.settings)
+    ctx.state.append_activity(
+        f"SESSION | fresh run — cleared {n_sessions} saved scan(s) and {n_cache} fuzzy cache file(s)"
+    )
+
+
+def schedule_fresh_scans_if_mounted(ctx: AppCtx) -> bool:
+    """Start exact duplicate scan when mounted with no results yet; fuzzy scan chains after exact."""
+    if not ctx.auto_scan_on_mount:
+        return False
+    mp = ctx.state.mount_path
+    if not mp or not mp.is_dir():
+        return False
+    with ctx.state.lock:
+        if ctx.state.duplicate_groups:
+            return False
+        phase = ctx.state.phase
+    if phase in _BUSY_PHASES:
+        return False
+    if phase not in (Phase.mounted, Phase.reviewing):
+        return False
+
+    from iphone_cleanup.api.routes import _run_scan_thread, _touch
+
+    ctx.state.scan_cancel_event.clear()
+    with ctx.state.lock:
+        ctx.state.scan_cancel_requested = False
+        ctx.state.pending_rescan_kind = "fuzzy"
+        ctx.state.scan_running_kind = "exact"
+    ctx.state.set_phase(Phase.scanning, detail="exact duplicate scan")
+    ctx.state.append_activity(
+        "SESSION | device mounted — starting fresh exact scan (fuzzy roll scan queued next)"
+    )
+    t = threading.Thread(target=_run_scan_thread, args=(ctx, "exact", False), daemon=True)
+    t.start()
+    _touch(ctx)
+    return True
 
 
 def bootstrap_runtime(ctx: AppCtx) -> None:

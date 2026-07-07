@@ -224,6 +224,21 @@ def fuzzy_roll_cache_path(scan_artifacts_dir: Path, mount_udid: str | None, moun
     return (base / f"{safe_udid}_{root_tag}.json").resolve()
 
 
+def clear_fuzzy_roll_cache(scan_artifacts_dir: Path) -> int:
+    """Remove all fuzzy-roll feature caches under ``scan_artifacts_dir``. Returns files removed."""
+    base = scan_artifacts_dir / "fuzzy_roll"
+    if not base.is_dir():
+        return 0
+    removed = 0
+    for path in base.glob("*.json"):
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def _default_fuzzy_match_config(phash_max_dim: int, max_adjacent_hamming: int) -> FuzzyMatchConfig:
     return FuzzyMatchConfig(
         phash_max_dim=phash_max_dim,

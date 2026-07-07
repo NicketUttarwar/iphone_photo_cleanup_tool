@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import time
 import uuid
 from datetime import datetime
@@ -26,6 +27,35 @@ _SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 def ensure_tree(root: Path) -> None:
     root.mkdir(parents=True, exist_ok=True)
     (root / SESSIONS_DIR).mkdir(parents=True, exist_ok=True)
+
+
+def clear_all_sessions(root: Path) -> int:
+    """Remove every saved scan session and active selection. Returns sessions deleted."""
+    ensure_tree(root)
+    removed = 0
+    sessions_dir = root / SESSIONS_DIR
+    if sessions_dir.is_dir():
+        for child in sessions_dir.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child)
+                removed += 1
+    (root / ACTIVE_FILE).unlink(missing_ok=True)
+    return removed
+
+
+def reset_scan_state(ctx: AppCtx) -> None:
+    """Clear in-memory duplicate review state (groups, keepers, roll cursor)."""
+    with ctx.state.lock:
+        ctx.state.duplicate_groups = []
+        ctx.state.group_keep = {}
+        ctx.state.scan_artifact_path = None
+        ctx.state.active_scan_session_id = None
+        ctx.state.active_exact_scan_session_id = None
+        ctx.state.active_fuzzy_scan_session_id = None
+        ctx.state.fuzzy_roll_next_start = 0
+        ctx.state.fuzzy_roll_total = None
+        ctx.state.library_indexed_count = None
+        ctx.state.pending_rescan_kind = None
 
 
 def _read_json(path: Path) -> dict[str, Any]:

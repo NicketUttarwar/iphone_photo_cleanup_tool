@@ -16,6 +16,7 @@ class AppCtx:
     no_open_browser: bool
     thumb_semaphore: threading.BoundedSemaphore
     run_session_id: str = ""
+    auto_scan_on_mount: bool = True
 
     def effective_keep_mode(self) -> str:
         """Compatibility shim for API payloads; keeper picks always start from auto ranking."""

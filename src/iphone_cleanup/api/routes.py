@@ -30,7 +30,11 @@ from iphone_cleanup.app_context import AppCtx
 from iphone_cleanup.app_log import log_event
 from iphone_cleanup.run_session import is_run_session_active
 from iphone_cleanup.runtime_session import persist_runtime, reconcile_busy_mount
-from iphone_cleanup.session_bootstrap import sync_device, sync_mount_from_disk
+from iphone_cleanup.session_bootstrap import (
+    schedule_fresh_scans_if_mounted,
+    sync_device,
+    sync_mount_from_disk,
+)
 from iphone_cleanup.state import Phase
 
 router = APIRouter()
@@ -122,6 +126,7 @@ def _run_mount_thread(ctx: AppCtx, job_id: str, udid: str | None) -> None:
         ctx.state.finish_job(job_id, msg or "Mounted.")
         _touch(ctx)
         log_event("mount_ok", udid=str(udid), mount_path=str(ctx.state.mount_path))
+        schedule_fresh_scans_if_mounted(ctx)
     except Exception as e:
         ctx.state.last_error = str(e)
         ctx.state.finish_job(job_id, str(e))
@@ -234,6 +239,7 @@ def api_mount(request: Request) -> dict[str, Any]:
         )
         _touch(ctx)
         log_event("mount_ok", udid=str(udid), mount_path=str(ctx.state.mount_path))
+        schedule_fresh_scans_if_mounted(ctx)
         return {"ok": True, "message": "Already mounted at this path.", "mount_path": str(ctx.state.mount_path)}
     ctx.state.append_activity(
         f"MOUNT REQUEST | operator started mount | mount_point={mp.resolve()} | udid={udid!r} | "

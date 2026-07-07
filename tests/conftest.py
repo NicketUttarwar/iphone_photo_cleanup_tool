@@ -72,7 +72,13 @@ def settings(repo_root: Path, defaults_path: Path) -> Settings:
 @pytest.fixture
 def app_ctx(settings: Settings) -> AppCtx:
     sem = threading.BoundedSemaphore(max(1, settings.max_concurrent_thumbnails))
-    return AppCtx(settings=settings, state=AppState(), no_open_browser=True, thumb_semaphore=sem)
+    return AppCtx(
+        settings=settings,
+        state=AppState(),
+        no_open_browser=True,
+        thumb_semaphore=sem,
+        auto_scan_on_mount=False,
+    )
 
 
 @pytest.fixture(autouse=True)
