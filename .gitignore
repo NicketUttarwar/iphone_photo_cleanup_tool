@@ -8,6 +8,7 @@ config/app.local.yaml
 config/secrets.local.yaml
 data/
 baba_iphone_photos/
+aii_iphone_photos/
 tmp/
 user_scans/*
 !user_scans/README.md

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Mount the iPhone over USB and copy all Camera Roll photos to baba_iphone_photos/."""
+"""Mount the iPhone over USB and copy all Camera Roll photos to aii_iphone_photos/."""
 
 from __future__ import annotations
 
 import shutil
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -13,7 +14,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from iphone_cleanup import device_bridge, mount  # noqa: E402
 
-OUTPUT_DIR = REPO_ROOT / "baba_iphone_photos"
+OUTPUT_DIR = REPO_ROOT / "aii_iphone_photos"
 MOUNT_POINT = REPO_ROOT / "data" / "iphone_mount"
 PROGRESS_EVERY = 50
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".gif", ".webp"}
@@ -39,12 +40,20 @@ def _collect_images(mount_root: Path) -> list[Path]:
     return sorted(images)
 
 
-def _dest_for_source(mount_root: Path, source: Path) -> Path:
-    try:
-        rel = source.resolve().relative_to(mount_root.resolve())
-    except ValueError:
-        rel = Path(source.name)
-    return OUTPUT_DIR / rel
+def _flat_dest_map(sources: list[Path]) -> dict[Path, Path]:
+    """Map each source to a flat path under OUTPUT_DIR (no subfolders)."""
+    by_name: dict[str, list[Path]] = defaultdict(list)
+    for source in sources:
+        by_name[source.name.lower()].append(source)
+
+    mapping: dict[Path, Path] = {}
+    for group in by_name.values():
+        if len(group) == 1:
+            mapping[group[0]] = OUTPUT_DIR / group[0].name
+            continue
+        for source in sorted(group, key=lambda p: str(p)):
+            mapping[source] = OUTPUT_DIR / f"{source.parent.name}_{source.name}"
+    return mapping
 
 
 def main() -> int:
@@ -74,14 +83,14 @@ def main() -> int:
     try:
         images = _collect_images(MOUNT_POINT)
         total = len(images)
+        dest_map = _flat_dest_map(images)
         _log(f"Found {total} photo(s) under { _effective_dcim_scan_root(MOUNT_POINT) }")
 
         for idx, source in enumerate(images, start=1):
-            dest = _dest_for_source(MOUNT_POINT, source)
+            dest = dest_map[source]
             if dest.exists() and dest.stat().st_size == source.stat().st_size:
                 skipped += 1
             else:
-                dest.parent.mkdir(parents=True, exist_ok=True)
                 try:
                     shutil.copy2(source, dest)
                     copied += 1
